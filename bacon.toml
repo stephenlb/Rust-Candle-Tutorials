@@ -1,0 +1,34 @@
+# Bacon config — https://dystroy.org/bacon
+# Sound requires bacon built with the `sound` feature:
+#   cargo install --locked --features sound bacon
+
+[sound]
+enabled = true
+base_volume = "100%"
+
+[jobs.check]
+command = ["cargo", "check", "--color", "always"]
+need_stdout = false
+on_success = "play-sound(name=success,volume=70)"
+on_failure = "play-sound(name=short-beep-tone,volume=90)"
+
+[jobs.check-all]
+command = ["cargo", "check", "--all-targets", "--color", "always"]
+need_stdout = false
+on_success = "play-sound(name=success,volume=70)"
+on_failure = "play-sound(name=short-beep-tone,volume=90)"
+
+[jobs.clippy]
+command = ["cargo", "clippy", "--all-targets", "--color", "always"]
+need_stdout = false
+on_success = "play-sound(name=success,volume=70)"
+on_failure = "play-sound(name=short-beep-tone,volume=90)"
+
+[jobs.test]
+command = ["cargo", "test", "--color", "always", "--", "--color", "always"]
+need_stdout = true
+on_success = "play-sound(name=success,volume=70)"
+on_failure = "play-sound(name=short-beep-tone,volume=90)"
+
+# Default job run on startup
+default_job = "check"
