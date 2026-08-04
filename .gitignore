@@ -1,1 +1,6 @@
 /target
+
+# bacon-tui runtime artifacts
+/.bacon-report.json
+/.bacon-tui.log
+/.bacon-locations
