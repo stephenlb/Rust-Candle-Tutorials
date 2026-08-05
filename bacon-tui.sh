@@ -15,6 +15,18 @@
 #
 # Requires a truecolor terminal (iTerm2, WezTerm, Ghostty, Kitty, tmux with
 # `set -g allow-passthrough`/24-bit color, modern Terminal.app fallback ok).
+#
+# Rendering notes (why this stays flicker-free at ~14fps in bash 3.2):
+#   * every frame is one write bracketed in DEC mode 2026 (synchronized
+#     output), so the terminal swaps a finished frame instead of showing our
+#     paint order. Terminals without 2026 ignore the private mode.
+#   * nothing clears the screen mid-loop; a clear is folded into the frame.
+#   * anything that does not change per frame (gradient fill strings, per-row
+#     styles, the hill ridge, block-font banners, the pulsing backdrops) is
+#     computed once and replayed from cache.
+#   * forks are kept off the render path: no `date`/`sleep`-per-draw, the
+#     report poll and log tail are throttled, and identical frames are not
+#     rewritten at all.
 
 set -u
 
@@ -33,6 +45,13 @@ JOB=${1:-check}
 REPORT=.bacon-report.json
 LOG=.bacon-tui.log
 FRAME_SLEEP=0.07
+POLL_EVERY=7          # frames between report/source polls  (~0.5s)
+LOG_EVERY=6           # frames between log tails            (~0.4s)
+OK_DELAY_MS=800       # hold the building scene this long after a pass, so the
+                      # success sound has time to play before the scene flips
+                      # to grass and sky
+FRAME_OVERHEAD_MS=30  # render + poll + drain per frame, on top of FRAME_SLEEP;
+                      # measured ~30ms, so a frame costs ~100ms not 70ms
 
 BACON_CONFIG='
 [exports.json_report]
@@ -45,9 +64,6 @@ command -v bacon >/dev/null 2>&1 || { echo "bacon not found in PATH" >&2; exit 1
 
 # sine lookup, 60 steps, scaled 0..999 (no floating point in bash)
 SIN=($(awk 'BEGIN{for(i=0;i<60;i++)printf "%d ",500+499*sin(6.28318530718*i/60)}'))
-
-SPACES="                                                                                                                                                                                                                                                                "
-DASHES="────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 
 # 5x5 block font, only the letters the banners need
 F_A=(" ### " "#   #" "#####" "#   #" "#   #")
@@ -73,7 +89,11 @@ term_size() {
     [ -n "${W:-}" ] || W=80
     (( H < 8 )) && H=8
     (( W < 30 )) && W=30
-    palette
+    # exactly W wide, so fills and padding never need re-slicing
+    printf -v SPACES "%${W}s" ""
+    DASHES=${SPACES// /─}
+    SCENE_H=0          # invalidate the cached palette / scene geometry
+    LOG_DIRTY=1
 }
 
 RESIZED=0
@@ -94,7 +114,7 @@ cleanup() {
         kill "$READER_PID" 2>/dev/null
     [ -n "${KEYFILE:-}" ] && rm -f "$KEYFILE"
     [ -n "${SAVED_STTY:-}" ] && stty "$SAVED_STTY" <"$TTY" 2>/dev/null
-    printf '\033[?25h\033[0m\033[?1049l'
+    printf '\033[?2026l\033[?25h\033[0m\033[?1049l'
     exit 0
 }
 
@@ -131,7 +151,8 @@ start_bacon() {
     bacon --headless -j "$JOB" --config-toml "$BACON_CONFIG" >>"$LOG" 2>&1 &
     BACON_PID=$!
     REPORT_MTIME=0
-    BUILD_START=$(date +%s)
+    BUILD_START=$(now)
+    LOG_DIRTY=1
 }
 
 # stats from the exported report; leaves previous values on a partial read
@@ -173,29 +194,70 @@ read_items() {
     ' "$REPORT" 2>/dev/null | head -n 14)
 }
 
+# ----------------------------------------------------------------- clock -----
+
+# `date` is a fork; SECONDS is a builtin. One fork at startup covers the rest.
+EPOCH0=$(date +%s)
+now() { printf '%s' $(( EPOCH0 + SECONDS )); }
+
 # ---------------------------------------------------------------- colors -----
 
 sty() { # fg r g b, bg r g b -> STY
     STY=$'\033[38;2;'"$1;$2;$3"$'m\033[48;2;'"$4;$5;$6"m
 }
-bgs() { # bg r g b -> STY (default fg)
-    STY=$'\033[39m\033[48;2;'"$1;$2;$3"m
+
+# BG_KIND selects how sty_row resolves the backdrop under an overlay. Using
+# \033[49m instead would punch default-background holes in the scene.
+#   1 fail pulse (formula)  2 building pulse (formula)  3 sky/hill  0 flat
+BG_KIND=0
+BG_LVL=0
+bg_at() { # row -> BGR BGG BGB
+    local t
+    case $BG_KIND in
+        1) t=$(( BG_LVL * (620 + 380 * $1 / H) / 1000 ))
+           BGR=$(( 12 + 210 * t / 1000 ))
+           BGG=$(( 6  + 26  * t / 1000 ))
+           BGB=$(( 8  + 30  * t / 1000 )) ;;
+        2) t=$(( BG_LVL * (500 + 500 * $1 / H) / 1000 ))
+           BGR=$(( 40 + 150 * t / 1000 ))
+           BGG=$(( 24 + 100 * t / 1000 ))
+           BGB=$(( 6  + 20  * t / 1000 )) ;;
+        3) if (( $1 < HZ )); then
+               BGR=${SKY_R[$1]}; BGG=${SKY_G[$1]}; BGB=${SKY_B[$1]}
+           else
+               BGR=${HILL_R[$1]:-0}; BGG=${HILL_G[$1]:-0}; BGB=${HILL_B[$1]:-0}
+           fi ;;
+        *) BGR=12; BGG=12; BGB=16 ;;
+    esac
 }
 
-# per-row sky/hill gradients, recomputed on resize
+sty_row() { # fg r g b, row
+    bg_at "$4"
+    sty "$1" "$2" "$3" "$BGR" "$BGG" "$BGB"
+}
+sty_over() { sty_row "$1" "$2" "$3" "$4"; }   # kept for readability at call sites
+
+# Per-row gradients plus every string derived from them. Called once per
+# distinct scene height (resize or view change), not per frame.
 palette() {
     HZ=$(( H * 62 / 100 ))          # horizon row
     (( HZ < 4 )) && HZ=4
     (( HZ > H-3 )) && HZ=$((H-3))
-    local r t
-    SKY_R=(); SKY_G=(); SKY_B=()
+    local r t g
+
+    SKY_R=(); SKY_G=(); SKY_B=(); SKY_FILL=(); CLOUD_STY=(); BIRD_STY=()
     for (( r=1; r<=HZ+2; r++ )); do
         t=$(( (r-1)*1000 / HZ ))
         SKY_R[$r]=$(( 30  + (172*t)/1000 ))
         SKY_G[$r]=$(( 104 + (114*t)/1000 ))
         SKY_B[$r]=$(( 196 + (52*t)/1000 ))
+        SKY_FILL[$r]=$'\033['"$r;1H"$'\033[39m\033[48;2;'"${SKY_R[$r]};${SKY_G[$r]};${SKY_B[$r]}"m"$SPACES"
+        sty 252 253 255 "${SKY_R[$r]}" "${SKY_G[$r]}" "${SKY_B[$r]}"; CLOUD_STY[$r]=$STY
+        sty 35 42 58    "${SKY_R[$r]}" "${SKY_G[$r]}" "${SKY_B[$r]}"; BIRD_STY[$r]=$STY
     done
-    HILL_R=(); HILL_G=(); HILL_B=()
+
+    HILL_R=(); HILL_G=(); HILL_B=(); HILL_FILL=()
+    FLW_A=(); FLW_B=(); FLW_C=(); FLW_D=()
     local span=$(( H - HZ ))
     (( span < 1 )) && span=1
     for (( r=HZ; r<=H; r++ )); do
@@ -203,7 +265,18 @@ palette() {
         HILL_R[$r]=$(( 124 - (98*t)/1000 ))
         HILL_G[$r]=$(( 202 - (94*t)/1000 ))
         HILL_B[$r]=$(( 96  - (48*t)/1000 ))
+        HILL_FILL[$r]=$'\033['"$r;1H"$'\033[39m\033[48;2;'"${HILL_R[$r]};${HILL_G[$r]};${HILL_B[$r]}"m"$SPACES"
+        sty 250 236 120 "${HILL_R[$r]}" "${HILL_G[$r]}" "${HILL_B[$r]}"; FLW_A[$r]=$STY
+        sty 252 200 224 "${HILL_R[$r]}" "${HILL_G[$r]}" "${HILL_B[$r]}"; FLW_B[$r]=$STY
+        sty 250 250 250 "${HILL_R[$r]}" "${HILL_G[$r]}" "${HILL_B[$r]}"; FLW_C[$r]=$STY
+        g=$(( ${HILL_G[$r]} + 46 )); (( g > 255 )) && g=255
+        sty $(( ${HILL_R[$r]} + 20 )) "$g" "${HILL_B[$r]}" \
+            "${HILL_R[$r]}" "${HILL_G[$r]}" "${HILL_B[$r]}"; FLW_D[$r]=$STY
     done
+
+    build_ridge
+    FAILBG=(); BLDBG=()             # pulsing backdrops depend on H
+    SCENE_H=$H
 }
 
 # ------------------------------------------------------------- primitives ----
@@ -227,16 +300,7 @@ put() { # row col style text  (clipped to the screen)
 }
 
 fill_row() { # row r g b
-    bgs "$2" "$3" "$4"
-    OUT+=$'\033['"$1;1H${STY}${SPACES:0:W}"
-    ROW_R[$1]=$2; ROW_G[$1]=$3; ROW_B[$1]=$4     # backdrop, for overlays
-}
-
-# fg over whatever backdrop this row was last filled with — overlays that use
-# \033[49m instead would punch default-background holes in the scene
-sty_row() { # r g b row
-    local row=$4
-    sty "$1" "$2" "$3" "${ROW_R[$row]:-0}" "${ROW_G[$row]:-0}" "${ROW_B[$row]:-0}"
+    OUT+=$'\033['"$1;1H"$'\033[39m\033[48;2;'"$2;$3;$4"m"$SPACES"
 }
 
 center() { # -> COL for a string length
@@ -262,20 +326,26 @@ bigtext() {
     BIG_W=${#BIG[0]}
 }
 
-# draw_big <top> <word> <fr fg fb> <sr sg sb>   colors as RGB, drop-shadow last
+# The three banners never change; rasterize them once instead of per frame.
+bigtext "ALL GOOD";     BANNER_OK=("${BIG[@]}");   BANNER_OK_W=$BIG_W
+bigtext "BUILD FAILED"; BANNER_FAIL=("${BIG[@]}"); BANNER_FAIL_W=$BIG_W
+bigtext "BUILDING";     BANNER_BLD=("${BIG[@]}");  BANNER_BLD_W=$BIG_W
+
+# draw_big <top> <banner array name> <fr fg fb> <sr sg sb>   shadow last
 draw_big() {
-    local top=$1 word=$2 fr=$3 fg=$4 fb=$5 sr=${6:-} sg=${7:-} sb=${8:-} i row
-    bigtext "$word"
-    center "$BIG_W"
+    local top=$1 arr=$2 fr=$3 fg=$4 fb=$5 sr=${6:-} sg=${7:-} sb=${8:-}
+    local i row rows w
+    eval "rows=(\"\${${arr}[@]}\"); w=\${${arr}_W}"
+    center "$w"
     for (( i=0; i<5; i++ )); do
         row=$(( top + i ))
         (( row > H-2 )) && break
         if [ -n "$sr" ] && (( row+1 <= H-2 )); then
             sty_row "$sr" "$sg" "$sb" $(( row + 1 ))
-            put $(( row + 1 )) $(( COL + 1 )) "$STY" "${BIG[$i]}"
+            put $(( row + 1 )) $(( COL + 1 )) "$STY" "${rows[$i]}"
         fi
         sty_row "$fr" "$fg" "$fb" "$row"
-        put "$row" "$COL" "$STY" "${BIG[$i]}"
+        put "$row" "$COL" "$STY" "${rows[$i]}"
     done
 }
 
@@ -296,37 +366,30 @@ draw_clouds() {
         while :; do
             eval "rows=\${CLOUD$i[$n]:-}"
             [ -n "$rows" ] || break
-            (( y+n >= 1 && y+n <= HZ )) && {
-                sty 252 253 255 "${SKY_R[$((y+n))]}" "${SKY_G[$((y+n))]}" "${SKY_B[$((y+n))]}"
-                put $((y+n)) $x "$STY" "$rows"
-            }
+            (( y+n >= 1 && y+n <= HZ )) &&
+                put $((y+n)) $x "${CLOUD_STY[$((y+n))]}" "$rows"
             n=$((n+1))
         done
         shift 3
     done
 }
 
+SUN_RING=("      ░░░░░      " "    ░░     ░░    " "   ░         ░   " "  ░           ░  " "   ░         ░   " "    ░░     ░░    " "      ░░░░░      ")
+SUN_DISC=("  █████  " " ███████ " "█████████" "█████████" "█████████" " ███████ " "  █████  ")
+
 draw_sun() {
     local f=$1 pulse=$2
     local sr=$(( 4 + HZ / 8 )) sc=$(( W / 7 + 2 ))
     local br=$(( 214 + pulse * 40 / 1000 ))
-    local n row cols rays
-    # glow ring
-    local gr=$(( 150 + pulse*60/1000 ))
-    local ring=("      ░░░░░      " "    ░░     ░░    " "   ░         ░   " "  ░           ░  " "   ░         ░   " "    ░░     ░░    " "      ░░░░░      ")
+    local gr=$(( 150 + pulse * 60 / 1000 ))
+    local n row
     for n in 0 1 2 3 4 5 6; do
         row=$(( sr - 3 + n ))
         (( row < 1 || row > HZ )) && continue
         sty 255 "$gr" 120 "${SKY_R[$row]}" "${SKY_G[$row]}" "${SKY_B[$row]}"
-        put "$row" $(( sc - 8 )) "$STY" "${ring[$n]}"
-    done
-    # disc
-    local disc=("  █████  " " ███████ " "█████████" "█████████" "█████████" " ███████ " "  █████  ")
-    for n in 0 1 2 3 4 5 6; do
-        row=$(( sr - 3 + n ))
-        (( row < 1 || row > HZ )) && continue
+        put "$row" $(( sc - 8 )) "$STY" "${SUN_RING[$n]}"
         sty 255 "$br" 70 "${SKY_R[$row]}" "${SKY_G[$row]}" "${SKY_B[$row]}"
-        put "$row" $(( sc - 4 )) "$STY" "${disc[$n]}"
+        put "$row" $(( sc - 4 )) "$STY" "${SUN_DISC[$n]}"
     done
     # spokes, breathing in and out
     local long=$(( pulse > 500 ? 1 : 0 ))
@@ -364,18 +427,16 @@ draw_birds() {
         y=$(( 2 + i + (HZ / 5) ))
         (( y < 1 || y > HZ )) && continue
         flap=$(( (f / 4 + i) % 2 ))
-        sty 35 42 58 "${SKY_R[$y]}" "${SKY_G[$y]}" "${SKY_B[$y]}"
-        if (( flap )); then put "$y" "$x" "$STY" "╲╱"
-        else                put "$y" "$x" "$STY" "╱╲"; fi
+        if (( flap )); then put "$y" "$x" "${BIRD_STY[$y]}" "╲╱"
+        else                put "$y" "$x" "${BIRD_STY[$y]}" "╱╲"; fi
     done
 }
 
-draw_hills() {
-    local c row crest top="" bot=""
-    # rolling crest: each column's hilltop sits on row HZ or HZ+1.
-    # ~2.5 slow waves across the width, plus a smaller ripple, so the ridge
-    # rolls instead of buzzing. One style per row keeps this to two writes.
-    local blend
+# The ridge is static for a given width: rasterize the two crest rows once.
+# ~2.5 slow waves across the width, plus a smaller ripple, so the ridge rolls
+# instead of buzzing. One style per row keeps this to two writes.
+build_ridge() {
+    local c blend crest top="" bot="" row
     for (( c=1; c<=W; c++ )); do
         # blend two waves to 0..999, then split the 2-row band at the midpoint
         blend=$(( ( ${SIN[$(( (c * 150 / W) % 60 ))]} * 3
@@ -389,23 +450,18 @@ draw_hills() {
     done
     sty "${HILL_R[$HZ]}" "${HILL_G[$HZ]}" "${HILL_B[$HZ]}" \
         "${SKY_R[$HZ]}" "${SKY_G[$HZ]}" "${SKY_B[$HZ]}"
-    put "$HZ" 1 "$STY" "$top"
+    RIDGE_TOP=$'\033['"$HZ;1H${STY}$top"
     row=$(( HZ + 1 ))
     sty "${HILL_R[$row]}" "${HILL_G[$row]}" "${HILL_B[$row]}" \
         "${SKY_R[$row]}" "${SKY_G[$row]}" "${SKY_B[$row]}"
-    put "$row" 1 "$STY" "$bot"
-    for (( row=HZ+2; row<=H-1; row++ )); do
-        fill_row "$row" "${HILL_R[$row]}" "${HILL_G[$row]}" "${HILL_B[$row]}"
-    done
+    RIDGE_BOT=$'\033['"$row;1H${STY}$bot"
 }
 
-# fg over whatever the backdrop is at that row (sky above the horizon, hill below)
-sty_over() { # r g b row
-    if (( $4 < HZ )); then
-        sty "$1" "$2" "$3" "${SKY_R[$4]}" "${SKY_G[$4]}" "${SKY_B[$4]}"
-    else
-        sty "$1" "$2" "$3" "${HILL_R[$4]}" "${HILL_G[$4]}" "${HILL_B[$4]}"
-    fi
+draw_hills() {
+    local row
+    OUT+=$RIDGE_TOP
+    OUT+=$RIDGE_BOT
+    for (( row=HZ+2; row<=H-1; row++ )); do OUT+=${HILL_FILL[$row]}; done
 }
 
 draw_tree() {
@@ -427,7 +483,7 @@ draw_tree() {
 }
 
 draw_meadow() {
-    local f=$1 i x y sway ch g span=$(( H - HZ - 2 ))
+    local f=$1 i x y sway span=$(( H - HZ - 2 ))
     (( span < 1 )) && return
     for (( i=0; i<44; i++ )); do
         # the row stride must not share a factor with span, or every flower
@@ -437,25 +493,19 @@ draw_meadow() {
         sway=$(( ${SIN[$(( (f*2 + i*9) % 60 ))]} / 400 ))     # 0..2
         x=$(( 2 + (i * 23 + i*i*3) % (W - 3) + sway ))
         case $(( i % 5 )) in
-            0) sty 250 236 120 "${HILL_R[$y]}" "${HILL_G[$y]}" "${HILL_B[$y]}"; ch="✿" ;;
-            1) sty 252 200 224 "${HILL_R[$y]}" "${HILL_G[$y]}" "${HILL_B[$y]}"; ch="✿" ;;
-            2) sty 250 250 250 "${HILL_R[$y]}" "${HILL_G[$y]}" "${HILL_B[$y]}"; ch="❀" ;;
-            *) g=$(( ${HILL_G[$y]} + 46 ))
-               (( g > 255 )) && g=255
-               sty $(( ${HILL_R[$y]} + 20 )) "$g" "${HILL_B[$y]}" \
-                   "${HILL_R[$y]}" "${HILL_G[$y]}" "${HILL_B[$y]}"
-               ch="ψ" ;;
+            0) put "$y" "$x" "${FLW_A[$y]}" "✿" ;;
+            1) put "$y" "$x" "${FLW_B[$y]}" "✿" ;;
+            2) put "$y" "$x" "${FLW_C[$y]}" "❀" ;;
+            *) put "$y" "$x" "${FLW_D[$y]}" "ψ" ;;
         esac
-        put "$y" "$x" "$STY" "$ch"
     done
 }
 
 scene_ok() {
     local f=$1 r pulse
     pulse=${SIN[$(( f % 60 ))]}     # bash expands all `local` words up front
-    for (( r=1; r<=HZ+1; r++ )); do
-        fill_row "$r" "${SKY_R[$r]}" "${SKY_G[$r]}" "${SKY_B[$r]}"
-    done
+    BG_KIND=3
+    for (( r=1; r<=HZ+1; r++ )); do OUT+=${SKY_FILL[$r]}; done
     draw_sun "$f" "$pulse"
     draw_clouds "$f"
     draw_birds "$f"
@@ -465,7 +515,7 @@ scene_ok() {
     # the banner needs room below the sun (which sits at ~HZ/8 + 4, 7 rows tall)
     local top=$(( HZ - 7 ))
     if (( H >= 22 && W >= 60 && top > HZ / 8 + 8 )); then
-        draw_big "$top" "ALL GOOD" 255 255 $(( 200 + pulse/12 ))  20 90 40
+        draw_big "$top" BANNER_OK 255 255 $(( 200 + pulse/12 ))  20 90 40
     else
         local msg="✓  ALL GOOD"
         center ${#msg}
@@ -476,22 +526,29 @@ scene_ok() {
 
 # -------------------------------------------------------------- fail scene ---
 
+# The pulse only ever takes 60 discrete levels, so the whole backdrop for a
+# level is built once and replayed from FAILBG afterwards.
 scene_fail() {
-    local f=$1 r lvl base row_lvl rr gg bb
-    lvl=${SIN[$(( (f * 5 / 2) % 60 ))]}          # red -> black -> red pulse
-    for (( r=1; r<=H-1; r++ )); do
-        row_lvl=$(( lvl * (620 + 380 * r / H) / 1000 ))
-        rr=$(( 12 + 210 * row_lvl / 1000 ))
-        gg=$(( 6  + 26  * row_lvl / 1000 ))
-        bb=$(( 8  + 30  * row_lvl / 1000 ))
-        fill_row "$r" "$rr" "$gg" "$bb"
-    done
+    local f=$1 idx lvl
+    idx=$(( (f * 5 / 2) % 60 ))          # red -> black -> red pulse
+    lvl=${SIN[$idx]}
+    BG_KIND=1; BG_LVL=$lvl
+    if [ -z "${FAILBG[$idx]:-}" ]; then
+        local s="" r
+        for (( r=1; r<=H-1; r++ )); do
+            bg_at "$r"
+            s+=$'\033['"$r;1H"$'\033[39m\033[48;2;'"$BGR;$BGG;$BGB"m"$SPACES"
+        done
+        FAILBG[$idx]=$s
+    fi
+    OUT+=${FAILBG[$idx]}
+
     local top glow=$(( 190 + lvl/12 ))
     # leave room for the banner (6 rows) plus the item list below it
     if (( H >= 16 && W >= 70 )); then
         top=$(( H/2 - 7 ))
         (( top < 1 )) && top=1
-        draw_big "$top" "BUILD FAILED" 255 "$glow" "$glow"  70 0 0
+        draw_big "$top" BANNER_FAIL 255 "$glow" "$glow"  70 0 0
         top=$(( top + 6 ))
     else
         top=2
@@ -538,19 +595,24 @@ scene_fail() {
 # ----------------------------------------------------------- building scene --
 
 scene_building() {
-    local f=$1 r lvl rr gg bb
-    lvl=${SIN[$(( (f * 2) % 60 ))]}
-    for (( r=1; r<=H-1; r++ )); do
-        local t=$(( lvl * (500 + 500 * r / H) / 1000 ))
-        rr=$(( 40 + 150 * t / 1000 ))
-        gg=$(( 24 + 100 * t / 1000 ))
-        bb=$(( 6  + 20  * t / 1000 ))
-        fill_row "$r" "$rr" "$gg" "$bb"
-    done
+    local f=$1 idx lvl
+    idx=$(( (f * 2) % 60 ))
+    lvl=${SIN[$idx]}
+    BG_KIND=2; BG_LVL=$lvl
+    if [ -z "${BLDBG[$idx]:-}" ]; then
+        local s="" r
+        for (( r=1; r<=H-1; r++ )); do
+            bg_at "$r"
+            s+=$'\033['"$r;1H"$'\033[39m\033[48;2;'"$BGR;$BGG;$BGB"m"$SPACES"
+        done
+        BLDBG[$idx]=$s
+    fi
+    OUT+=${BLDBG[$idx]}
+
     local top=$(( H/2 - 3 )) msg
     (( top < 1 )) && top=1
     if (( H >= 14 && W >= 52 )); then
-        draw_big "$top" "BUILDING" 255 $(( 200 + lvl/12 )) 150  60 30 0
+        draw_big "$top" BANNER_BLD 255 $(( 200 + lvl/12 )) 150  60 30 0
         top=$(( top + 6 ))
     else
         msg="BUILDING…"
@@ -559,8 +621,8 @@ scene_building() {
         put "$top" "$COL" $'\033[1m'"$STY" "$msg"
         top=$(( top + 2 ))
     fi
-    local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' idx=$(( (f/2) % 10 ))
-    msg="${spin:idx:1} cargo ${JOB}   ${ELAPSED}s"
+    local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' idx2=$(( (f/2) % 10 ))
+    msg="${spin:idx2:1} cargo ${JOB}   ${ELAPSED}s"
     center ${#msg}
     sty_row 255 226 180 "$top"
     put "$top" "$COL" "$STY" "$msg"
@@ -568,21 +630,41 @@ scene_building() {
 
 # --------------------------------------------------------------- log pane ----
 
-draw_log() { # first_row
-    local top=$1 r=$1 line n=$(( H - $1 - 1 )) rule
-    for (( ; r<=H-1; r++ )); do fill_row "$r" 12 12 16; done
-    rule=$(( W > 20 ? W - 20 : 2 ))
-    put "$top" 2 $'\033[38;2;150;150;170m\033[48;2;12;12;16m' "── bacon output ${DASHES:0:rule}"
-    (( n < 1 )) && return
-    r=$(( top + 1 ))
-    # one sed for the whole tail: bacon's own ANSI would otherwise fight ours
+LOG_LINES=()
+LOG_DIRTY=1
+
+# one sed for the whole tail: bacon's own ANSI would otherwise fight ours.
+# Throttled by the caller, so this pair of forks is not on every frame.
+refresh_log() {
+    local line
+    LOG_LINES=()
     while IFS= read -r line; do
-        (( r > H-1 )) && break
-        (( ${#line} > W-3 )) && line=${line:0:W-3}
-        put "$r" 2 $'\033[38;2;205;210;220m\033[48;2;12;12;16m' "$line"
-        r=$(( r + 1 ))
-    done < <(tail -n "$n" "$LOG" 2>/dev/null |
+        LOG_LINES[${#LOG_LINES[@]}]=$line
+    done < <(tail -n "$H" "$LOG" 2>/dev/null |
              LC_ALL=C sed $'s/\033\\[[0-9;?]*[a-zA-Z]//g; s/\r//g')
+    LOG_DIRTY=0
+}
+
+LOG_STY=$'\033[38;2;205;210;220m\033[48;2;12;12;16m'
+LOG_HDR=$'\033[38;2;150;150;170m\033[48;2;12;12;16m'
+
+draw_log() { # first_row
+    local top=$1 r line n=$(( H - $1 - 1 )) rule i start
+    BG_KIND=0
+    for (( r=top; r<=H-1; r++ )); do fill_row "$r" 12 12 16; done
+    rule=$(( W > 20 ? W - 20 : 2 ))
+    put "$top" 2 "$LOG_HDR" "── bacon output ${DASHES:0:rule}"
+    (( n < 1 )) && return
+    start=$(( ${#LOG_LINES[@]} - n ))
+    (( start < 0 )) && start=0
+    r=$(( top + 1 ))
+    for (( i=start; i<${#LOG_LINES[@]}; i++ )); do
+        (( r > H-1 )) && break
+        line=${LOG_LINES[$i]}
+        (( ${#line} > W-3 )) && line=${line:0:W-3}
+        put "$r" 2 "$LOG_STY" "$line"
+        r=$(( r + 1 ))
+    done
 }
 
 draw_scene() {
@@ -591,6 +673,16 @@ draw_scene() {
         fail)     scene_fail "$FRAME" ;;
         building) scene_building "$FRAME" ;;
     esac
+}
+
+# Draw the scene at a reduced height without recomputing the palette every
+# frame: the gradients only get rebuilt when that height actually changes.
+render_scene_at() { # height
+    local save=$H
+    H=$1
+    (( SCENE_H != $1 )) && palette
+    draw_scene
+    H=$save
 }
 
 # -------------------------------------------------------------- status bar ---
@@ -628,11 +720,18 @@ stty -echo -icanon min 0 time 0 <"$TTY"   # non-blocking single-key reads
 
 PROJECT=${PWD##*/}
 ERRORS=0; WARNINGS=0; TEST_FAILS=0; CMD_ERROR=0; ITEMS=()
-REPORT_MTIME=0; STAMP=$(date +%s); AGE=0; ELAPSED=0; BUILD_START=$STAMP
+REPORT_MTIME=0; STAMP=$(now); AGE=0; ELAPSED=0; BUILD_START=$STAMP
 VIEW=scene       # scene | split | log
 PAUSED=0
 FRAME=0
 KEYS=""; BUILDING=1; STATE=building
+PREV_STATE=building; OK_HOLD=0
+# frames per OK_DELAY_MS, from the real cadence (sleep + per-frame overhead)
+OK_DELAY_FRAMES=$(awk -v ms="$OK_DELAY_MS" -v s="$FRAME_SLEEP" -v o="$FRAME_OVERHEAD_MS" \
+    'BEGIN{ n=int(ms / (s*1000 + o) + 0.5); if (n < 1) n = 1; print n }')
+SCENE_H=0
+PREV_OUT=""
+REDRAW=1
 
 printf '\033[?1049h\033[?25l\033[2J'
 term_size
@@ -640,17 +739,17 @@ start_reader
 start_bacon
 
 while :; do
-    (( RESIZED )) && { RESIZED=0; term_size; printf '\033[2J'; }
+    (( RESIZED )) && { RESIZED=0; term_size; REDRAW=1; PREV_OUT=""; }
 
     # ---- poll state (cheap: only when the report actually changed) ----
-    if (( FRAME % 4 == 0 )); then
+    if (( FRAME % POLL_EVERY == 0 )); then
         mt=$(stat -f %m "$REPORT" 2>/dev/null || echo 0)
         if [ "$mt" != "$REPORT_MTIME" ]; then
             REPORT_MTIME=$mt
             read_stats
             read_items
         fi
-        STAMP=$(date +%s)
+        STAMP=$(( EPOCH0 + SECONDS ))
         if [ "${REPORT_MTIME:-0}" -gt 0 ] 2>/dev/null; then
             AGE=$(( STAMP - REPORT_MTIME ))
             (( AGE < 0 )) && AGE=0
@@ -679,23 +778,47 @@ while :; do
     else STATE=ok
     fi
 
+    # A pass is the one transition with a sound cue attached, so hold the
+    # building scene for OK_DELAY_FRAMES before the grass-and-sky reveal —
+    # the flip lands with the tail of the chime instead of ahead of it.
+    # Failures and reruns cancel the pending reveal.
+    if [ "$STATE" = ok ] && [ "$PREV_STATE" != ok ]; then
+        OK_HOLD=$OK_DELAY_FRAMES
+    elif [ "$STATE" != ok ]; then
+        OK_HOLD=0
+    fi
+    PREV_STATE=$STATE
+    if (( OK_HOLD > 0 )); then
+        OK_HOLD=$(( OK_HOLD - 1 ))
+        STATE=building
+        (( OK_HOLD == 0 )) && REDRAW=1     # clean slate for the reveal
+    fi
+
     # ---- render ----
+    case "$VIEW" in
+        scene) : ;;
+        *) (( LOG_DIRTY || FRAME % LOG_EVERY == 0 )) && refresh_log ;;
+    esac
+
     OUT=""
+    (( REDRAW )) && { OUT=$'\033[2J'; REDRAW=0; }
     case "$VIEW" in
         log) draw_log 1 ;;
         split)
-            # draw the scene into the top half: shrink H, rebuild the row
-            # gradients for that height, then restore
             SPLIT_TOP=$(( H / 2 ))
-            SAVE_H=$H; H=$SPLIT_TOP; palette
-            draw_scene
-            H=$SAVE_H; palette
+            render_scene_at "$SPLIT_TOP"
             draw_log $(( SPLIT_TOP + 1 ))
             ;;
-        *)  draw_scene ;;
+        *)  render_scene_at "$H" ;;
     esac
     status_bar "$STATE"
-    printf '%s' "$OUT"
+
+    # One synchronized write per frame: the terminal never shows a half-painted
+    # scene. Identical frames (paused, idle) are not written at all.
+    if [ "$OUT" != "$PREV_OUT" ]; then
+        printf '\033[?2026h%s\033[?2026l' "$OUT"
+        PREV_OUT=$OUT
+    fi
 
     # ---- input ---- (bash 3.2 has no fractional `read -t`, so: sleep + drain)
     sleep "$FRAME_SLEEP"
@@ -705,14 +828,14 @@ while :; do
         case "$key" in
             q|Q) cleanup ;;
             p|P) PAUSED=$(( 1 - PAUSED )) ;;
-            r|R) start_bacon; printf '\033[2J' ;;
+            r|R) start_bacon; REDRAW=1 ;;
             l|L) case "$VIEW" in
                      scene) VIEW=split ;;
                      split) VIEW=log ;;
                      *)     VIEW=scene ;;
                  esac
-                 printf '\033[2J' ;;
-            1|2|3|4) JOB=${JOBS[$(( key - 1 ))]}; start_bacon; printf '\033[2J' ;;
+                 LOG_DIRTY=1; REDRAW=1 ;;
+            1|2|3|4) JOB=${JOBS[$(( key - 1 ))]}; start_bacon; REDRAW=1 ;;
         esac
     done
 

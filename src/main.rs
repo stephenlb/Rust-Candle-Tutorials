@@ -2,7 +2,6 @@ use candle_core::{ Device, Tensor };
 use candle_nn::{Linear, Module};
 use anyhow::Result;
 
-
 struct XORModel {
     layer1: Linear,
     layer2: Linear,
