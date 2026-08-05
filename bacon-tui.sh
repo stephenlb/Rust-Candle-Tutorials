@@ -8,7 +8,7 @@
 # bacon's own output into a log file. The report drives the animation:
 #
 #   errors / test failures  ->  red pulse, fading red -> black -> red
-#   clean                   ->  lush green sunny day (sun, clouds, birds)
+#   clean                   ->  lush green sunny day (sun, clouds, birds, cat)
 #   compiling               ->  amber shimmer
 #
 # Keys: q quit · 1-4 switch job · r rerun · l cycle log view · p pause anim
@@ -274,6 +274,11 @@ palette() {
             "${HILL_R[$r]}" "${HILL_G[$r]}" "${HILL_B[$r]}"; FLW_D[$r]=$STY
     done
 
+    # the cat's feet row: mid-meadow, never on the status bar
+    CAT_BASE=$(( HZ + 3 + (H - HZ - 4) / 2 ))
+    (( CAT_BASE > H-1 )) && CAT_BASE=$(( H - 1 ))
+    (( CAT_BASE < HZ + 3 )) && CAT_BASE=$(( HZ + 3 ))
+
     build_ridge
     FAILBG=(); BLDBG=()             # pulsing backdrops depend on H
     SCENE_H=$H
@@ -501,6 +506,61 @@ draw_meadow() {
     done
 }
 
+# ---------------------------------------------------------------- the cat ----
+
+# A ginger cat trots across the meadow, stopping now and then to sit and bat at
+# a flower. One tick counter drives both position and gait (f/3, so ~4 cols per
+# second): the crossing is split into 4 walking segments with a sit between
+# each, so `tick` maps to (segment, offset) with no state to carry per frame.
+CAT_BACK="    ▁▂▂▂▂"           # arched back, then the ears line up over the eyes
+CAT_EARS='/\_/\'
+CAT_LEGS=("   ╱▌ ▐╲" "   ▌╲ ╱▐")
+CAT_SIT="   ▟▟▟▟"
+CAT_TAILS=("⌒" "~" "⌢" "~")
+CAT_PAUSE=18                    # ticks spent sitting at each stop
+
+draw_cat() { # frame
+    local f=$1 tick chunk seg i rem x sitting=0 sf=0 eyes tail row ear mid pr
+    row=${CAT_BASE:-0}
+    ear=$(( row - 2 )); mid=$(( row - 1 ))
+    (( ear < 1 || row > H-1 )) && return
+
+    seg=$(( (W + 22) / 4 ))
+    (( seg < 8 )) && seg=8
+    chunk=$(( seg + CAT_PAUSE ))
+    tick=$(( (f / 3) % (4 * seg + 4 * CAT_PAUSE) ))
+    i=$(( tick / chunk )); rem=$(( tick % chunk ))
+    if (( rem < seg )); then
+        x=$(( i * seg + rem ))
+    else
+        sitting=1; sf=$(( rem - seg )); x=$(( i * seg + seg ))
+    fi
+    x=$(( x - 20 ))
+
+    eyes="o.o"
+    (( sitting && (sf / 3) % 5 == 4 )) && eyes="—.—"    # a slow blink mid-sit
+    tail=${CAT_TAILS[$(( (f / 4) % 4 ))]}
+
+    sty_over 240 158 84 "$ear"
+    put "$ear" "$x" "$STY" "$CAT_BACK"
+    put "$ear" $(( x + 9 )) "$STY" "$CAT_EARS"
+    sty_over 240 158 84 "$mid"
+    put "$mid" $(( x + 2 )) "$STY" "${tail}█████( ${eyes} )"
+
+    sty_over 214 132 66 "$row"
+    if (( sitting )); then
+        put "$row" "$x" "$STY" "$CAT_SIT"
+        # a paw swipes between the two rows at the flower it found
+        pr=$(( (sf / 2) % 2 ? mid : row ))
+        sty_over 252 218 178 "$pr"
+        put "$pr" $(( x + 16 )) "$STY" "▖"
+        sty_over 250 236 120 "$row"
+        put "$row" $(( x + 18 + (sf / 2) % 2 )) "$STY" "✿"
+    else
+        put "$row" "$x" "$STY" "${CAT_LEGS[$(( (f / 3) % 2 ))]}"
+    fi
+}
+
 scene_ok() {
     local f=$1 r pulse
     pulse=${SIN[$(( f % 60 ))]}     # bash expands all `local` words up front
@@ -511,6 +571,7 @@ scene_ok() {
     draw_birds "$f"
     draw_hills
     draw_meadow "$f"
+    draw_cat "$f"        # over the flowers, so it walks in front of them
     draw_tree            # last, so flowers never punch through the trunk
     # the banner needs room below the sun (which sits at ~HZ/8 + 4, 7 rows tall)
     local top=$(( HZ - 7 ))
