@@ -1,24 +1,18 @@
-use candle_core::{ Device, Tensor };
-use candle_nn::{Linear, Module};
+use candle_core::{DType, Device, Tensor};
+use candle_nn::{linear, Linear, Module, Optimizer, VarBuilder, VarMap, SGD};
 use anyhow::Result;
 
-struct XORModel {
-    layer1: Linear,
+struct XORModel { // MLP Multi Layer Perceptron
+    layer1: Linear, 
     layer2: Linear,
     layer3: Linear,
 }
 
-fn linear(device: &Device, size: (usize, usize)) -> Result<Linear> {
-    let weights1 = Tensor::randn(0.0, 1.0, size, device)?;
-    let bias1 = Tensor::randn(0f32, 1.0, (100, ), device)?;
-    Ok(Linear::new(weights1, Some(bias1)))
-}
-
 impl XORModel {
-    fn new(device: Device) -> Result<Self> {
-        let layer1 = linear(&device, (2, 4))?;
-        let layer2 = linear(&device, (4, 8))?;
-        let layer3 = linear(&device, (8, 1))?;
+    fn new(vb: VarBuilder) -> Result<Self> {
+        let layer1 = linear(2, 4, vb.pp("layer1"))?;
+        let layer2 = linear(4, 8, vb.pp("layer2"))?;
+        let layer3 = linear(8, 1, vb.pp("layer3"))?;
 
         Ok(Self {
             layer1,
@@ -26,11 +20,10 @@ impl XORModel {
             layer3,
         })
     }
-    fn forward(&self, input: Tensor) -> Result<Tensor> {
-        let out = self.layer1.forward(&input)?;
-        //let out = input.matmul(&self.layer1)?;
-        //let out = out.matmul(&self.layer2)?;
-        //let out = out.matmul(&self.layer3)?;
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let out = self.layer1.forward(input)?;
+        let out = self.layer2.forward(&out)?;
+        let out = self.layer3.forward(&out)?;
 
         Ok(out)
     }
@@ -40,14 +33,29 @@ fn main() -> Result<()> {
     println!("Stephen's favorite machine learning hello world XOR Operator");
     let device = Device::Cpu;
     let features = [[1.0, 1.0], [0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
-    let labels   = [ 0.0,        0.0,        1.0,        1.0      ];
-
+    let labels   = [[0.0],      [0.0],      [1.0],      [1.0]     ];
     let input: Tensor = Tensor::new(&features, &device)?; 
-    let model = XORModel::new(device)?;
+    let targets: Tensor = Tensor::new(&labels, &device)?; 
 
-    let output = model.forward(input)?;
+    let vm = VarMap::new();
+    let vb = VarBuilder::from_varmap(&vm, DType::F64, &device);
+    let model = XORModel::new(vb)?;
+    let learing_rate = 0.02;
+    let mut optimizer = SGD::new(vm.all_vars(), learing_rate)?;
 
-    //println!("{output}");
+    // Training Phase
+    let epochs = 400;
+    for epoch in 0..=epochs {
+        let output = model.forward(&input)?;
+        let loss = candle_nn::loss::mse(&output, &targets)?;
+        optimizer.backward_step(&loss)?;
+        let loss_val: f64 = loss.to_scalar()?;
+        println!("Epoch: {epoch} Loss: {loss_val}");
+    }
+
+    let output = model.forward(&input)?;
+    println!("{output}");
+
 
     Ok(())
 }
