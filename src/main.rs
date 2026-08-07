@@ -21,9 +21,9 @@ impl XORModel {
         })
     }
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        let out = self.layer1.forward(input)?;
-        let out = self.layer2.forward(&out)?;
-        let out = self.layer3.forward(&out)?;
+        let out = self.layer1.forward(input)?.tanh()?;
+        let out = self.layer2.forward(&out)?.tanh()?;
+        let out = self.layer3.forward(&out)?.tanh()?;
 
         Ok(out)
     }
@@ -44,7 +44,7 @@ fn main() -> Result<()> {
     let mut optimizer = SGD::new(vm.all_vars(), learing_rate)?;
 
     // Training Phase
-    let epochs = 400;
+    let epochs = 800;
     for epoch in 0..=epochs {
         let output = model.forward(&input)?;
         let loss = candle_nn::loss::mse(&output, &targets)?;
