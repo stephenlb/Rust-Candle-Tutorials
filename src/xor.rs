@@ -1,57 +1,29 @@
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{
-    seq, Sequential,
-    linear, Linear,
-    Module,
-    VarBuilder, VarMap,
-    SGD, Optimizer
-};
+use candle_nn::{linear, Linear, Module, Optimizer, VarBuilder, VarMap, SGD};
 use anyhow::Result;
 
-
-/**
- - TODO build model simple version
- - TODO build full model
- - TODO simple image for training
- - TODO training data
- - TODO image loader png -> Tensor
- - TODO 
- - TODO 
- - TODO 
- - TODO 
-
-**/
-
-struct Diffusion {
-    encoder: Sequential, 
+struct XORModel { // MLP Multi Layer Perceptron
     layer1: Linear, 
-    //layer2: Linear,
-    //layer3: Linear,
+    layer2: Linear,
+    layer3: Linear,
 }
 
-impl Diffusion {
+impl XORModel {
     fn new(vb: VarBuilder) -> Result<Self> {
         let layer1 = linear(2, 4, vb.pp("layer1"))?;
-        let layer2 = linear(2, 4, vb.pp("layer2"))?;
-        let layer3 = linear(2, 4, vb.pp("layer3"))?;
-        let other: Sequential = seq()
-            .add(layer3);
-        let encoder: Sequential = seq()
-            .add(other)
-            .add(layer2)
-            .add_fn( |xs|  xs.tanh() );
-        //let layer2 = linear(4, 8, vb.pp("layer2"))?;
-        //let layer3 = linear(8, 1, vb.pp("layer3"))?;
+        let layer2 = linear(4, 8, vb.pp("layer2"))?;
+        let layer3 = linear(8, 1, vb.pp("layer3"))?;
 
         Ok(Self {
-            encoder,
             layer1,
+            layer2,
+            layer3,
         })
     }
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let out = self.layer1.forward(input)?.tanh()?;
-        //let out = self.layer2.forward(&out)?.tanh()?;
-        //let out = self.layer3.forward(&out)?.tanh()?;
+        let out = self.layer2.forward(&out)?.tanh()?;
+        let out = self.layer3.forward(&out)?.tanh()?;
 
         Ok(out)
     }
@@ -67,7 +39,7 @@ fn main() -> Result<()> {
 
     let vm = VarMap::new();
     let vb = VarBuilder::from_varmap(&vm, DType::F64, &device);
-    let model = Diffusion::new(vb)?;
+    let model = XORModel::new(vb)?;
     let learing_rate = 0.02;
     let mut optimizer = SGD::new(vm.all_vars(), learing_rate)?;
 
