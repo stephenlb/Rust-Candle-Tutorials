@@ -22,34 +22,39 @@ use anyhow::Result;
 
 **/
 
-struct Diffusion {
+struct VAE {
     encoder: Sequential, 
-    layer1: Linear, 
-    //layer2: Linear,
-    //layer3: Linear,
+    encoder_to_decoder: Linear,
+    decoder: Sequential, 
+    fc_mu: Linear, 
+    fc_var: Linear, 
 }
 
-impl Diffusion {
-    fn new(vb: VarBuilder) -> Result<Self> {
-        let layer1 = linear(2, 4, vb.pp("layer1"))?;
-        let layer2 = linear(2, 4, vb.pp("layer2"))?;
-        let layer3 = linear(2, 4, vb.pp("layer3"))?;
-        let other: Sequential = seq()
-            .add(layer3);
+/// Variational Auto Encoder
+impl VAE {
+    fn new(vb: VarBuilder, hidden: usize) -> Result<Self> {
         let encoder: Sequential = seq()
-            .add(other)
-            .add(layer2)
+            .add(linear(2, hidden, vb.pp("encoder-layer1"))?)
+            .add(linear(hidden, hidden, vb.pp("encoder-layer2"))?)
+            .add_fn( |xs| xs.tanh() );
+        let encoder_to_decoder = linear(hidden, hidden, vb.pp("layer3"))?;
+        let decoder: Sequential = seq()
+            .add(linear(hidden, hidden, vb.pp("encoder-layer1"))?)
+            .add(linear(hidden, hidden, vb.pp("encoder-layer2"))?)
             .add_fn( |xs|  xs.tanh() );
-        //let layer2 = linear(4, 8, vb.pp("layer2"))?;
-        //let layer3 = linear(8, 1, vb.pp("layer3"))?;
+        let fc_mu = linear(2, 4, vb.pp("layer1"))?;
+        let fc_var = linear(2, 4, vb.pp("layer2"))?;
 
         Ok(Self {
             encoder,
-            layer1,
+            decoder,
+            encoder_to_decoder,
+            fc_mu,
+            fc_var,
         })
     }
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        let out = self.layer1.forward(input)?.tanh()?;
+        let out = self.encoder.forward(input)?;
         //let out = self.layer2.forward(&out)?.tanh()?;
         //let out = self.layer3.forward(&out)?.tanh()?;
 
@@ -67,7 +72,7 @@ fn main() -> Result<()> {
 
     let vm = VarMap::new();
     let vb = VarBuilder::from_varmap(&vm, DType::F64, &device);
-    let model = Diffusion::new(vb)?;
+    let model = VAE::new(vb, 64)?;
     let learing_rate = 0.02;
     let mut optimizer = SGD::new(vm.all_vars(), learing_rate)?;
 
