@@ -32,9 +32,9 @@ struct VAE {
 
 /// Variational Auto Encoder
 impl VAE {
-    fn new(vb: VarBuilder, hidden: usize, latent: usize) -> Result<Self> {
+    fn new(vb: VarBuilder, pixels: usize, hidden: usize, latent: usize) -> Result<Self> {
         let encoder: Sequential = seq()
-            .add(linear(2, hidden, vb.pp("encoder-layer1"))?)
+            .add(linear(pixels * pixels * 3, hidden, vb.pp("encoder-layer1"))?)
             .add(linear(hidden, hidden, vb.pp("encoder-layer2"))?)
             .add_fn( |xs| xs.tanh() );
         let encoder_to_decoder = linear(latent, hidden, vb.pp("layer3"))?;
@@ -42,8 +42,8 @@ impl VAE {
             .add(linear(hidden, latent, vb.pp("encoder-layer1"))?)
             .add(linear(hidden, latent, vb.pp("encoder-layer2"))?)
             .add_fn( |xs|  xs.tanh() );
-        let fc_mu = linear(2, 4, vb.pp("layer1"))?;
-        let fc_var = linear(2, 4, vb.pp("layer2"))?;
+        let fc_mu = linear(hidden, latent, vb.pp("layer1"))?;
+        let fc_var = linear(hidden, latent, vb.pp("layer2"))?;
 
         Ok(Self {
             encoder,
@@ -72,7 +72,7 @@ fn main() -> Result<()> {
 
     let vm = VarMap::new();
     let vb = VarBuilder::from_varmap(&vm, DType::F64, &device);
-    let model = VAE::new(vb, 64, 32)?;
+    let model = VAE::new(vb, 32, 64, 32)?;
     let learing_rate = 0.02;
     let mut optimizer = SGD::new(vm.all_vars(), learing_rate)?;
 
