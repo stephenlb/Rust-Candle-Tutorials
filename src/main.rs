@@ -45,10 +45,10 @@ impl VAE {
         let config: Conv2dConfig = Conv2dConfig { stride: 2, padding: 1, ..Default::default() };
         let encoder: Conv2d = conv2d(3, 3, 3, config, vb.pp("conv2d-encoder"))?;
         let encoder_to_decoder = linear(latent, hidden, vb.pp("translator"))?;
-        let decoder: Conv2d = conv2d(3, 3, 3, config, vb.pp("conv2d-decoder"))?;
         let fc_mu = linear(hidden * 4, latent, vb.pp("fc_mu"))?;
         let fc_var = linear(hidden * 4, latent, vb.pp("fc_var"))?;
-        let output = conv2d(3, 3, 3, config, vb.pp("conv2d-output"))?;
+        let decoder: Conv2d = conv2d(hidden, hidden, 3, config, vb.pp("conv2d-decoder"))?;
+        let output = conv2d(hidden, 3, 3, config, vb.pp("conv2d-output"))?;
 
         Ok(Self {
             encoder,
@@ -79,8 +79,8 @@ impl VAE {
         //println!("fc_mu {:?}", fc_mu.shape());
         let fc_var = self.fc_var.forward(&flat)?;
         //println!("fc_var {:?}", fc_var.shape());
-        let repram = self.reparamerterize(&fc_mu, &fc_var)?;
-        let out = self.decode(&repram)?;
+        let latent = self.reparamerterize(&fc_mu, &fc_var)?;
+        let out = self.decode(&latent)?;
 
         //let out = self.encoder.forward(input)?;
         //let out = self.layer2.forward(&out)?.tanh()?;
@@ -90,7 +90,9 @@ impl VAE {
     }
 
     fn decode(&self, input: &Tensor) -> Result<Tensor> {
+        println!("DECODE input {:?}", input.shape());
         let out = self.decoder.forward(input)?;
+        println!("out {:?}", out.shape());
         Ok(out)
     }
 
