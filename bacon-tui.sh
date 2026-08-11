@@ -2,6 +2,8 @@
 # bacon-tui.sh — animated terminal dashboard for bacon
 #
 #   ./bacon-tui.sh [job]        # job defaults to `check`
+#   ./bacon-tui.sh --list-scenes        # every scene name, by state
+#   ./bacon-tui.sh --scene carousel     # preview one scene, no bacon needed
 #
 # It runs `bacon --headless` for you, telling bacon to auto-export a machine
 # readable report after every mission (`[exports.json_report]`), and tails
@@ -27,13 +29,14 @@
 #                                waterfall · hearth · steam train ·
 #                                lighthouse · kites · carousel ·
 #                                snowy village · desert meteors ·
-#                                rainy window)
+#                                rainy window with a storm going by)
 #   compiling               ->  amber shimmer
 #
 # A fresh variant is drawn each time the state flips, and never the same one
 # twice in a row.
 #
 # Keys: q quit · 1-4 switch job · r rerun · l cycle log view · p pause anim
+#       --scene mode: q quit · n/N next/prev scene · p pause anim
 #
 # Requires a truecolor terminal (iTerm2, WezTerm, Ghostty, Kitty, tmux with
 # `set -g allow-passthrough`/24-bit color, modern Terminal.app fallback ok).
@@ -63,7 +66,7 @@ case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
 esac
 
 JOBS=(check check-all clippy test)
-JOB=${1:-check}
+JOB=check
 REPORT=.bacon-report.json
 LOG=.bacon-tui.log
 FRAME_SLEEP=0.07
@@ -82,7 +85,51 @@ exporter = "json_report"
 path = ".bacon-report.json"
 '
 
-command -v bacon >/dev/null 2>&1 || { echo "bacon not found in PATH" >&2; exit 1; }
+# ------------------------------------------------------------------- args ----
+
+# SCENE_ONLY pins one variant and runs the loop without bacon, so a scene can be
+# looked at on its own. The variant tables live further down (they name functions
+# defined between here and there), so --scene only records the request; it is
+# resolved in main, once the tables exist.
+SCENE_ONLY=""
+LIST_SCENES=0
+
+usage() {
+    cat <<'EOF'
+usage: bacon-tui.sh [job] [options]
+
+  job                  bacon job to run: check (default), check-all, clippy, test
+
+  --scene NAME         skip bacon and show one scene on a loop, for previewing.
+                       NAME is a variant from --list-scenes, with or without its
+                       scene_ok_ / scene_fail_ prefix ("carousel", "fail:lava").
+                       Fail scenes are shown with a sample failure list.
+  --list-scenes        print every scene name, grouped by state, and exit
+  -h, --help           this message
+
+keys: q quit · 1-4 switch job · r rerun · l cycle log view · p pause anim
+      in --scene mode: n/N step to the next/previous scene of that state
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --scene)
+            [ $# -ge 2 ] || { echo "--scene needs a scene name" >&2; exit 2; }
+            SCENE_ONLY=$2; shift 2 ;;
+        --scene=*)   SCENE_ONLY=${1#*=}; shift ;;
+        --list-scenes) LIST_SCENES=1; shift ;;
+        -h|--help)   usage; exit 0 ;;
+        -*)          echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+        *)           JOB=$1; shift ;;
+    esac
+done
+
+# --scene and --list-scenes never shell out to bacon, so they work anywhere
+if [ -z "$SCENE_ONLY" ] && (( ! LIST_SCENES )); then
+    command -v bacon >/dev/null 2>&1 ||
+        { echo "bacon not found in PATH" >&2; exit 1; }
+fi
 
 # sine lookup, 60 steps, scaled 0..999 (no floating point in bash)
 SIN=($(awk 'BEGIN{for(i=0;i<60;i++)printf "%d ",500+499*sin(6.28318530718*i/60)}'))
@@ -232,6 +279,7 @@ sty() { # fg r g b, bg r g b -> STY
 # \033[49m instead would punch default-background holes in the scene.
 #   1 fail pulse (formula)  2 building pulse (formula)  3 sky/hill
 #   4 per-row table (BGROW_*, filled by the scene)  0 flat
+#   5 window pane (PANE_*, filled by the window scene's frame rasterizer)
 BG_KIND=0
 BG_LVL=0
 bg_at() { # row -> BGR BGG BGB
@@ -251,6 +299,11 @@ bg_at() { # row -> BGR BGG BGB
                BGR=${HILL_R[$1]:-0}; BGG=${HILL_G[$1]:-0}; BGB=${HILL_B[$1]:-0}
            fi ;;
         4) BGR=${BGROW_R[$1]:-12}; BGG=${BGROW_G[$1]:-12}; BGB=${BGROW_B[$1]:-16} ;;
+        5) if [ -n "${PANE_R[$1]:-}" ]; then
+               BGR=${PANE_R[$1]}; BGG=${PANE_G[$1]}; BGB=${PANE_B[$1]}
+           else
+               BGR=${BGROW_R[$1]:-12}; BGG=${BGROW_G[$1]:-12}; BGB=${BGROW_B[$1]:-16}
+           fi ;;
         *) BGR=12; BGG=12; BGB=16 ;;
     esac
 }
@@ -3142,21 +3195,116 @@ scene_ok_kites() {
 
 # -------------------------------------------------- happy scene: carousel ----
 
-# A carousel turning at a night fair: a striped canopy with bulbs chasing round
-# the rim, horses swinging past on their poles — the ones on the near side drawn
-# large and low, the far side small and high — and warm light on the ground.
-CAROUSEL_H=("▟▀▙" "▐█▌")
+# A carousel turning at a night fair: a scalloped canopy with the stripes
+# walking round it, bulbs chasing the valance, horses swinging past on brass
+# poles — the near side low and lit, the far side small, high and behind the
+# mirrored drum — and warm light pooling on the ground with the crowd in it.
+#
+# The canopy's shape depends only on the window and the stripe phase, so all
+# CAR_PHASES phases are rasterized on demand and replayed; the tents pitched
+# beside the ride are fixed for a window size and cached the same way. Only the
+# horses, the bulbs, the mirrors and the crowd are redrawn per frame.
+# facing right: ears and head, then the neck, the body with its tail, the legs
+CAR_NEAR=("        ▄▟▖" "    ▗▄▄███▛" "▚▄█████████" "  ▐▌   ▐▌  ")
+CAR_FAR=("     ▄▟" "  ▄████" "▚██████" " ▌   ▌ ")
+CAR_STRIPE=3                    # columns per stripe
+CAR_PHASES=6                    # 2 * CAR_STRIPE, so the stripes loop seamlessly
+CAR_CANOPY=(); CAR_CANOPY_KEY=""
+CAR_FAIR=""; CAR_FAIR_KEY=""
+
+# one canopy phase: four sloping rows of stripes, then the scalloped valance
+build_carousel_canopy() { # idx apex cx unit
+    local idx=$1 apex=$2 cx=$3 unit=$4
+    local n r half c lo hi len start k stripe dim fr fg fb lobe save=$OUT
+    local sh=$(( CAR_PHASES - idx ))    # so a rising phase walks the stripes right
+    OUT=""
+    for n in 0 1 2 3 4; do
+        r=$(( apex + n ))
+        (( r < 1 || r > H-1 )) && continue
+        half=$(( (n + 1) * unit + 2 ))
+        (( n == 4 )) && lobe="▙█▟" || lobe="███"
+        # the stripe grid is offset by the phase, so the run boundaries walk
+        # sideways and the whole canopy reads as turning
+        start=$(( -half - (half + sh) % CAR_STRIPE ))
+        for (( c=start; c<=half; c+=CAR_STRIPE )); do
+            lo=$(( c < -half ? -half : c ))
+            hi=$(( c + CAR_STRIPE - 1 )); (( hi > half )) && hi=$half
+            len=$(( hi - lo + 1 ))
+            (( len < 1 )) && continue
+            k=$(( c + half + sh + 300 ))     # kept positive: bash truncates to 0
+            stripe=$(( (k / CAR_STRIPE) % 2 ))
+            dim=$(( 1000 - (c < 0 ? -c : c) * 420 / half ))
+            (( dim < 300 )) && dim=300
+            if (( stripe )); then fr=232; fg=72; fb=78
+            else                  fr=248; fg=242; fb=232
+            fi
+            bgtable_sty $(( fr*dim/1000 )) $(( fg*dim/1000 )) $(( fb*dim/1000 )) "$r"
+            put "$r" $(( cx + lo )) "$STY" "${lobe:$(( lo - c )):len}"
+        done
+    done
+    CAR_CANOPY[$idx]=$OUT
+    OUT=$save
+}
+
+# the tents pitched either side of the ride, with bunting strung between them
+build_carousel_fair() { # cy cx
+    local cy=$1 cx=$2 i n r c x y w half line save=$OUT
+    OUT=""
+    for i in 0 1; do
+        x=$(( i == 0 ? W/9 : W - W/9 ))
+        for n in 0 1 2 3 4; do
+            r=$(( cy - 4 + n ))
+            (( r < 1 || r > H-1 )) && continue
+            half=$(( n + 1 ))
+            line=""
+            for (( c=-half; c<=half; c++ )); do
+                (( (c + 60 + i) % 3 )) && line+="█" || line+="▓"
+            done
+            bgtable_sty $(( 122 - n*8 )) $(( 78 - n*6 )) $(( 100 - n*7 )) "$r"
+            put "$r" $(( x - half )) "$STY" "$line"
+        done
+        r=$(( cy - 5 ))
+        (( r >= 1 )) && {
+            bgtable_sty 190 150 90 "$r"
+            put "$r" "$x" "$STY" "╽"
+        }
+    done
+    # bunting sagging between the two tent poles, behind the ride
+    r=$(( cy - 5 ))
+    if (( r >= 1 )); then
+        for (( c=W/9; c<=W-W/9; c+=4 )); do
+            y=$(( r + (c / 4) % 2 ))
+            (( y < 1 || y > H-1 )) && continue
+            case $(( (c / 4) % 3 )) in
+                0) bgtable_sty 208 88 84 "$y" ;;
+                1) bgtable_sty 226 186 96 "$y" ;;
+                *) bgtable_sty 110 168 186 "$y" ;;
+            esac
+            put "$y" "$c" "$STY" "▾"
+        done
+    fi
+    CAR_FAIR=$OUT
+    OUT=$save
+}
 
 scene_ok_carousel() {
-    local f=$1 r t i x y top msg cx cy apex half n g line c ph depth bob lum
+    local f=$1 r t i x y top msg cx cy apex unit half n g c ph depth bob idx
+    local lum sway drum ride orbit
 
-    cy=$(( H * 66 / 100 ))
+    cy=$(( H * 68 / 100 ))
     (( cy < 10 )) && cy=10
-    (( cy > H-3 )) && cy=$(( H-3 ))
-    # the canopy has to clear the far-side horses, which ride at cy-5
-    apex=$(( cy - 10 ))
+    (( cy > H-4 )) && cy=$(( H-4 ))
+    unit=$(( W / 14 )); (( unit < 2 )) && unit=2
+    # the canopy and its valance need six rows over the far-side horses, which
+    # ride at cy-6
+    apex=$(( cy - 12 ))
     (( apex < 1 )) && apex=1
+    drum=$(( apex + 6 ))
     cx=$(( W / 2 ))
+    # the ride's radius comes from the canopy, so the platform beneath it and the
+    # orbit the horses swing along stay inside the roof at any window size
+    ride=$(( 5 * unit + 2 ))
+    orbit=$(( ride - 7 )); (( orbit < 4 )) && orbit=4
     BG_KIND=4
     if [ "$BG_KEY" != "car$H" ]; then
         bgtable_reset
@@ -3166,10 +3314,14 @@ scene_ok_carousel() {
                              $(( 40 + 34*t/1000 ))
         done
         BG_KEY="car$H"
+        CAR_CANOPY_KEY=""; CAR_FAIR_KEY=""   # both sit on this backdrop
     fi
     bgtable_paint
 
     # the rest of the fair, lit up behind it
+    [ "$CAR_FAIR_KEY" = "$H$W" ] ||
+        { build_carousel_fair "$cy" "$cx"; CAR_FAIR_KEY="$H$W"; }
+    OUT+=$CAR_FAIR
     for (( i=0; i<22; i++ )); do
         y=$(( 2 + (i * 3) % (apex > 2 ? apex : 2) ))
         x=$(( 1 + (i * 41 + i*i*7) % W ))
@@ -3179,83 +3331,153 @@ scene_ok_carousel() {
         fi
     done
 
-    # the canopy: four rows of stripes that shift sideways as the ride turns
-    for n in 0 1 2 3; do
-        r=$(( apex + n ))
-        (( r < 1 || r > H-1 )) && continue
-        half=$(( (n + 1) * (W / 14) + 2 ))
-        line=""
-        for (( c=0; c<half*2+1; c++ )); do line+="█"; done
-        if (( (n + f/3) % 2 )); then bgtable_sty 226 66 72 "$r"
-        else                         bgtable_sty 246 240 232 "$r"
-        fi
-        put "$r" $(( cx - half )) "$STY" "$line"
+    # the far side of the ride, behind the drum: small, dim, riding high
+    for (( i=0; i<8; i++ )); do
+        ph=$(( (f + i * 8) % 60 ))
+        depth=${SIN[$(( (ph + 15) % 60 ))]}
+        (( depth > 500 )) && continue
+        # x is the sprite's left edge, so the 7-wide far horse is pulled back by
+        # half its width to sit centred on the orbit
+        x=$(( cx + (${SIN[$ph]} - 500) * orbit / 500 - 3 ))
+        bob=$(( (${SIN[$(( (f*3 + i*15) % 60 ))]} - 500) / 400 ))
+        y=$(( cy - 7 + bob ))
+        for (( r=y+4; r<=cy-1; r++ )); do
+            (( r < 1 || r > H-1 )) && continue
+            bgtable_sty 120 104 62 "$r"
+            put "$r" $(( x + 3 )) "$STY" "│"
+        done
+        for n in 0 1 2 3; do
+            r=$(( y + n ))
+            (( r < 1 || r > H-1 )) && continue
+            case $n in
+                0) bgtable_sty 152 132 120 "$r" ;;
+                1) bgtable_sty 142 122 112 "$r" ;;
+                2) bgtable_sty 130 112 104 "$r" ;;
+                *) bgtable_sty 110 94 88 "$r" ;;
+            esac
+            put "$r" "$x" "$STY" "${CAR_FAR[$n]}"
+        done
     done
-    # bulbs chasing each other round the rim of the canopy
-    r=$(( apex + 4 ))
-    half=$(( 4 * (W / 14) + 2 ))
+
+    # the drum in the middle, with mirror panels catching the bulbs
+    for (( r=drum; r<=cy-1; r++ )); do
+        (( r < 1 )) && continue
+        bgtable_sty 206 180 132 "$r"
+        put "$r" $(( cx - 2 )) "$STY" "▐██▌"
+        # mirror panels: a highlight sliding down the drum as it turns
+        if (( (r + f/2) % 4 == 0 )); then
+            lum=$(( 218 + ${SIN[$(( (f*3 + r*11) % 60 ))]} * 37 / 1000 ))
+            bgtable_sty "$lum" $(( lum - 18 )) $(( lum - 64 )) "$r"
+            put "$r" $(( cx - 1 )) "$STY" "▀▀"
+        fi
+    done
+
+    # the canopy, over the top of the drum and the far-side horses
+    idx=$(( (f / 2) % CAR_PHASES ))
+    [ "$CAR_CANOPY_KEY" = "$H$W$apex" ] ||
+        { CAR_CANOPY=(); CAR_CANOPY_KEY="$H$W$apex"; }
+    [ -n "${CAR_CANOPY[$idx]:-}" ] || build_carousel_canopy "$idx" "$apex" "$cx" "$unit"
+    OUT+=${CAR_CANOPY[$idx]}
+    # the finial, and a pennant snapping in the breeze above it
+    for n in 1 2; do
+        r=$(( apex - n ))
+        (( r < 1 )) && break
+        bgtable_sty 226 196 120 "$r"
+        put "$r" "$cx" "$STY" "│"
+    done
+    r=$(( apex - 2 ))
+    if (( r >= 1 )); then
+        bgtable_sty 232 84 88 "$r"
+        (( (f/4) % 2 )) && put "$r" $(( cx + 1 )) "$STY" "◤" \
+                        || put "$r" $(( cx + 1 )) "$STY" "◥"
+    fi
+    # bulbs chasing each other round under the valance
+    r=$(( apex + 5 ))
+    half=$(( 5 * unit + 2 ))
     if (( r >= 1 && r <= H-1 )); then
         for (( c=-half; c<=half; c+=3 )); do
             if (( ((c + half) / 3 + f / 2) % 3 == 0 )); then
-                bgtable_sty 255 236 160 "$r"
+                bgtable_sty 255 238 168 "$r"
                 put "$r" $(( cx + c )) "$STY" "◉"
             else
-                bgtable_sty 150 120 80 "$r"
+                bgtable_sty 148 118 78 "$r"
                 put "$r" $(( cx + c )) "$STY" "◦"
             fi
         done
     fi
 
-    # the centre column, and the platform it all stands on
-    for (( r=apex+5; r<=cy-1; r++ )); do
-        (( r < 1 )) && continue
-        bgtable_sty 214 190 140 "$r"
-        put "$r" $(( cx - 1 )) "$STY" "▐▌"
-    done
+    # the platform it all stands on
     for (( r=cy; r<=cy+1 && r<=H-1; r++ )); do
-        half=$(( W/6 - (r - cy) * 2 ))
+        half=$(( ride - (r - cy) * 2 ))
         (( half < 3 )) && half=3
         tile_of "█" $(( half * 2 + 2 ))
         bgtable_sty $(( 130 - (r - cy) * 20 )) $(( 96 - (r - cy) * 16 )) 70 "$r"
         put "$r" $(( cx - half )) "$STY" "${TILE:0:$(( half * 2 + 1 ))}"
     done
 
-    # six horses on the turn: the phase decides both where they are across the
-    # ride and whether they are on the near side (low and bright) or the far
-    for (( i=0; i<6; i++ )); do
-        ph=$(( (f * 2 + i * 10) % 60 ))
-        x=$(( cx + (${SIN[$ph]} - 500) * (W/6) / 500 ))
+    # the near side, in front of everything: bigger, warmly lit, riding low
+    for (( i=0; i<8; i++ )); do
+        ph=$(( (f + i * 8) % 60 ))
         depth=${SIN[$(( (ph + 15) % 60 ))]}
-        bob=$(( (${SIN[$(( (f*4 + i*20) % 60 ))]} - 500) / 400 ))
-        if (( depth > 500 )); then
-            y=$(( cy - 2 + bob ))
-            g=240
-        else
-            y=$(( cy - 5 + bob ))
-            g=150
-        fi
-        # the pole the horse rides on
-        for (( r=y+2; r<=cy-1; r++ )); do
+        (( depth > 500 )) || continue
+        # likewise for the 11-wide near horse
+        x=$(( cx + (${SIN[$ph]} - 500) * orbit / 500 - 5 ))
+        bob=$(( (${SIN[$(( (f*3 + i*15) % 60 ))]} - 500) / 340 ))
+        y=$(( cy - 4 + bob ))
+        # the brass pole it rides on, running the full height of the ride
+        for (( r=apex+6; r<=cy-1; r++ )); do
             (( r < 1 || r > H-1 )) && continue
-            bgtable_sty $(( g - 40 )) $(( g - 50 )) 110 "$r"
-            put "$r" $(( x + 1 )) "$STY" "│"
+            bgtable_sty 224 186 104 "$r"
+            put "$r" $(( x + 4 )) "$STY" "│"
         done
-        for n in 0 1; do
+        for n in 0 1 2 3; do
             r=$(( y + n ))
             (( r < 1 || r > H-1 )) && continue
-            if (( n == 0 )); then bgtable_sty "$g" $(( g - 30 )) $(( g - 90 )) "$r"
-            else bgtable_sty $(( g - 40 )) $(( g - 70 )) $(( g - 120 )) "$r"
-            fi
-            put "$r" "$x" "$STY" "${CAROUSEL_H[$n]}"
+            case $n in
+                0) bgtable_sty 250 240 222 "$r" ;;
+                1) bgtable_sty 244 230 206 "$r" ;;
+                2) bgtable_sty 234 216 186 "$r" ;;
+                *) bgtable_sty 206 184 156 "$r" ;;
+            esac
+            put "$r" "$x" "$STY" "${CAR_NEAR[$n]}"
         done
+        # saddle and bridle, so each horse has some colour of its own
+        r=$(( y + 2 ))
+        (( r >= 1 && r <= H-1 )) && {
+            case $(( i % 3 )) in
+                0) bgtable_sty 214 76 92 "$r" ;;
+                1) bgtable_sty 110 160 210 "$r" ;;
+                *) bgtable_sty 226 176 84 "$r" ;;
+            esac
+            put "$r" $(( x + 4 )) "$STY" "▬▬"
+            bgtable_sty 220 60 76 $(( y + 1 ))
+            put $(( y + 1 )) $(( x + 8 )) "$STY" "▪"
+        }
     done
 
-    # the light the ride throws down onto the fairground
-    tile_of "░▒░  ░ ▒" $(( W + 12 ))
+    # the light the ride throws down onto the fairground, brightest under it
+    tile_of "  ░   ░ " $(( W + 12 ))
     for (( r=cy+2; r<=H-1; r++ )); do
-        lum=$(( 120 - (r - cy) * 8 )); (( lum < 40 )) && lum=40
+        lum=$(( 96 - (r - cy) * 8 )); (( lum < 34 )) && lum=34
         bgtable_sty "$lum" $(( lum * 4 / 5 )) $(( lum / 2 )) "$r"
         put "$r" 1 "$STY" "${TILE:$(( (f/5 + r * 3) % 8 )):W}"
+        half=$(( ride - (r - cy) * 4 ))
+        if (( half > 2 )); then
+            tile_of "▒░▒ ░" $(( half * 2 + 6 ))
+            bgtable_sty $(( lum + 60 )) $(( lum + 34 )) $(( lum / 2 + 16 )) "$r"
+            put "$r" $(( cx - half )) "$STY" \
+                "${TILE:$(( (f/5 + r) % 5 )):$(( half * 2 + 1 ))}"
+        fi
+    done
+    # the crowd watching from the front, shifting on their feet
+    for (( i=0; i<7; i++ )); do
+        (( H - 2 > cy + 1 )) || break
+        x=$(( 2 + (i * 31 + i*i*13) % (W - 4) ))
+        sway=$(( (${SIN[$(( (f + i*17) % 60 ))]} - 500) / 460 ))
+        bgtable_sty 46 32 36 $(( H - 2 ))
+        put $(( H - 2 )) $(( x + sway )) "$STY" "▄"
+        bgtable_sty 36 25 30 $(( H - 1 ))
+        put $(( H - 1 )) "$x" "$STY" "▐▌"
     done
 
     top=$(( apex / 2 - 3 ))
@@ -3582,24 +3804,106 @@ scene_ok_desert() {
 
 # ----------------------------------------------------- happy scene: window ----
 #
-# Indoors, looking out: rain running down the glass of a lit room's window, the
-# town blurred into soft lights beyond it, a mug steaming on the sill and a
-# plant leaning into the frame. The frame, the sill and everything standing on
-# it are fixed for a window size and rasterized once; the rain, the lights and
-# the steam are all that move.
-WINDOW=""; WINDOW_KEY=""
+# Indoors, looking out: rain running down the glass of a lit room's window, a
+# stepped town skyline blurred into soft lights beyond it, distant lightning
+# silhouetting the roofs, a mug steaming on the sill and a plant leaning into
+# the frame. The frame, the sill, the skyline and everything standing on the
+# sill are fixed for a window size and rasterized once; the rain, the lights,
+# the flashes and the steam are all that move.
+#
+# The cache comes in two halves: WINDOW is everything seen *through* the glass,
+# WINDOW_FG everything standing in front of it (frame, mullions, sill, boards,
+# mug, plant). The rain is drawn between them, so drops stay out in the night
+# instead of running down the woodwork and over the mug.
+WINDOW=""; WINDOW_FG=""; WINDOW_KEY=""
 
-build_window() { # py1 py2 px1 px2 sill
-    local py1=$1 py2=$2 px1=$3 px2=$4 sill=$5 r wide save=$OUT lum
+# Anything drawn over the glass with a glyph that is not a solid block shows its
+# background through, and bgtable_sty would hand it the room's warm brown. These
+# hold the pane's own colour per row, filled while the frame is rasterized, so
+# rain, town lights and reflections sit on night instead of on the wall.
+PANE_R=(); PANE_G=(); PANE_B=()
+
+# A lightning flash brightens the pane for a frame or two. Rather than rewrite
+# the cached table (and have to put it back afterwards), the lift is a pair of
+# globals the lookup adds in, for rows above the roofline only.
+PANE_LIFT=0; PANE_LIFT_TO=0
+
+pane_sty() { # fg r g b, row
+    local br=${PANE_R[$4]:-20} bg=${PANE_G[$4]:-26} bb=${PANE_B[$4]:-46}
+    if (( PANE_LIFT && $4 < PANE_LIFT_TO )); then
+        br=$(( br + PANE_LIFT )); bg=$(( bg + PANE_LIFT )); bb=$(( bb + PANE_LIFT ))
+    fi
+    sty "$1" "$2" "$3" "$br" "$bg" "$bb"
+}
+
+build_window() { # py1 py2 px1 px2 sill skyline_row
+    local py1=$1 py2=$2 px1=$3 px2=$4 sill=$5 sk=$6
+    local r c wide save=$OUT lum g bt=() dep
     wide=$(( px2 - px1 + 1 ))
     OUT=""
-    # the night outside, seen through the glass
+    # the night outside: overcast slate up top, warming a touch at the roofline
+    # from the town's own light, so the silhouette has something to stand against
+    PANE_R=(); PANE_G=(); PANE_B=()
     tile_of "█" $(( wide + 2 ))
     for (( r=py1; r<=py2; r++ )); do
-        bgtable_sty $(( 16 + (r - py1) )) $(( 22 + (r - py1) * 2 )) \
-                    $(( 42 + (r - py1) * 2 )) "$r"
+        g=$(( (r - py1) * 1000 / (sk - py1 > 0 ? sk - py1 : 1) ))
+        (( g > 1000 )) && g=1000
+        bgtable_sty $(( 34 + 34*g/1000 )) $(( 42 + 30*g/1000 )) \
+                    $(( 62 + 20*g/1000 )) "$r"
         put "$r" "$px1" "$STY" "${TILE:0:wide}"
+        if (( r < sk )); then
+            PANE_R[$r]=$(( 34 + 34*g/1000 ))
+            PANE_G[$r]=$(( 42 + 30*g/1000 ))
+            PANE_B[$r]=$(( 62 + 20*g/1000 ))
+        else
+            # below the roofline the town fills most of the glass, so the colour
+            # a raindrop sits on is the buildings, not the sky
+            PANE_R[$r]=20; PANE_G[$r]=23; PANE_B[$r]=34
+        fi
     done
+    # the town: blocks five columns wide, each with its own roof height, a gap
+    # column between them so the night shows through. Column-at-a-time because
+    # the run of sky beside a roof must stay the pane's colour, not the room's.
+    for (( c=0; c<wide; c++ )); do
+        g=$(( c / 5 ))
+        (( c % 5 == 4 )) && continue                  # the alley between blocks
+        bt[$c]=$(( sk + (py2 - sk) * (1000 - ${SIN[$(( (g * 13) % 60 ))]}) / 2400 ))
+    done
+    for (( c=0; c<wide; c++ )); do
+        [ -n "${bt[$c]:-}" ] || continue
+        g=$(( (c / 5) % 3 ))
+        dep=$(( 14 + g * 7 ))
+        for (( r=${bt[$c]}; r<=py2; r++ )); do
+            (( r < py1 || r > H-1 )) && continue
+            bgtable_sty "$dep" $(( dep + 3 )) $(( dep + 14 )) "$r"
+            put "$r" $(( px1 + c )) "$STY" "█"
+        done
+        # a lit window here and there, dim enough for the flicker pass to own
+        if (( c % 5 == 1 && (c * 7 + sk) % 3 == 0 )); then
+            r=$(( ${bt[$c]} + 1 + (c % 3) ))
+            (( r >= py1 && r <= py2 )) && {
+                pane_sty 132 106 62 "$r"
+                put "$r" $(( px1 + c )) "$STY" "▪"
+            }
+        fi
+    done
+    # the lamp behind us, reflected in the glass as a soft slanted smear
+    for (( r=py1; r<=py2; r++ )); do
+        lum=$(( 54 - (r - py1) * 5 )); (( lum < 14 )) && lum=14
+        pane_sty $(( 96 + lum )) $(( 84 + lum )) $(( 62 + lum )) "$r"
+        put "$r" $(( px1 + 2 + (r - py1) / 2 )) "$STY" "░"
+    done
+    # condensation hazing the corners of the pane, where the glass is coldest
+    for (( r=py1; r<=py1+2 && r<=py2; r++ )); do
+        pane_sty $(( 150 - (r - py1) * 20 )) $(( 168 - (r - py1) * 20 )) \
+                 $(( 190 - (r - py1) * 18 )) "$r"
+        tile_of "░▒░ " $(( wide + 4 ))
+        put "$r" "$px1" "$STY" "${TILE:0:$(( 4 - (r - py1) ))}"
+        put "$r" $(( px2 - 3 + (r - py1) )) "$STY" "${TILE:0:$(( 4 - (r - py1) ))}"
+    done
+    WINDOW=$OUT
+    # ---- foreground: everything indoors, drawn after the rain ----
+    OUT=""
     # the frame, and the two mullions crossing the pane
     tile_of "█" $(( wide + 6 ))
     for r in $(( py1 - 1 )) $(( py2 + 1 )); do
@@ -3635,24 +3939,37 @@ build_window() { # py1 py2 px1 px2 sill
         bgtable_sty $(( lum - 18 )) $(( lum / 2 )) $(( lum / 3 )) "$r"
         put "$r" 1 "$STY" "${TILE:$(( (r * 4) % 11 )):W}"
     done
-    # the mug and the plant, stood on the sill
+    # the mug, two rows tall with a handle, and the plant beside the far jamb
     r=$(( sill - 1 ))
     if (( r >= 1 && r <= H-1 )); then
-        bgtable_sty 236 230 220 "$r"
-        put "$r" $(( px1 + 2 )) "$STY" "▐█▌"
+        bgtable_sty 238 232 222 "$r"
+        put "$r" $(( px1 + 2 )) "$STY" "▙▄▟"
+        (( r-1 >= 1 )) && {
+            bgtable_sty 246 242 236 $(( r - 1 ))
+            put $(( r - 1 )) $(( px1 + 2 )) "$STY" "▛▀▜"
+            bgtable_sty 214 206 196 $(( r - 1 ))
+            put $(( r - 1 )) $(( px1 + 5 )) "$STY" "╮"
+            bgtable_sty 214 206 196 "$r"
+            put "$r" $(( px1 + 5 )) "$STY" "╯"
+        }
         bgtable_sty 118 78 58 "$r"
-        put "$r" $(( px2 - 4 )) "$STY" "▟█▙"
+        put "$r" $(( px2 - 5 )) "$STY" "▟█▙"
         (( r-1 >= 1 )) && {
             bgtable_sty 92 158 88 $(( r - 1 ))
-            put $(( r - 1 )) $(( px2 - 5 )) "$STY" "ψ❦ψ"
+            put $(( r - 1 )) $(( px2 - 6 )) "$STY" "ψ❦ψ"
+        }
+        (( r-2 >= 1 )) && {
+            bgtable_sty 108 174 100 $(( r - 2 ))
+            put $(( r - 2 )) $(( px2 - 5 )) "$STY" "❦"
         }
     fi
-    WINDOW=$OUT
+    WINDOW_FG=$OUT
     OUT=$save
 }
 
 scene_ok_window() {
-    local f=$1 r t i x y top msg py1 py2 px1 px2 sill wide lum g n
+    local f=$1 r t i x y top msg py1 py2 px1 px2 sill sk wide lum g n
+    local cyc p flash slant
     py1=$(( 2 + H/12 )); (( py1 < 2 )) && py1=2
     sill=$(( H - 4 )); (( sill > H-2 )) && sill=$(( H - 2 ))
     (( sill < py1 + 3 )) && sill=$(( py1 + 3 ))
@@ -3664,6 +3981,9 @@ scene_ok_window() {
     (( px2 < px1 + 6 )) && px2=$(( px1 + 6 ))
     (( px2 > W )) && px2=$W
     wide=$(( px2 - px1 + 1 ))
+    sk=$(( py2 - (py2 - py1) / 3 ))
+    (( sk < py1 + 1 )) && sk=$(( py1 + 1 ))
+    (( sk > py2 )) && sk=$py2
     BG_KIND=4
     if [ "$BG_KEY" != "wnd$H" ]; then
         bgtable_reset
@@ -3688,56 +4008,108 @@ scene_ok_window() {
     done
 
     [ "$WINDOW_KEY" = "$H$W" ] ||
-        { build_window "$py1" "$py2" "$px1" "$px2" "$sill"; WINDOW_KEY="$H$W"; }
+        { build_window "$py1" "$py2" "$px1" "$px2" "$sill" "$sk"
+          WINDOW_KEY="$H$W"; }
     OUT+=$WINDOW
+    # from here on everything lands on the glass, so overlays resolve their
+    # backdrop from the pane table (rows off the pane fall back to the room).
+    # The frame and the things on the sill go on last, over the top of the rain.
+    BG_KIND=5
 
-    # the town out there, blurred into soft lights by the wet glass
-    for (( i=0; i<18; i++ )); do
-        y=$(( py2 - (i % 3) ))
+    # a storm going by somewhere out there: two flashes, close together, every
+    # ~18s. Only the sky above the roofline lights up, so the town stays a
+    # silhouette the way it does through real weather. The flash paints the sky
+    # itself and lifts the pane colour, so the rain over it lights up too.
+    flash=0
+    p=$(( (f + 41) % 250 ))
+    (( p < 2 )) && flash=$(( 60 - p * 22 ))
+    (( p > 3 && p < 6 )) && flash=26
+    PANE_LIFT=$flash; PANE_LIFT_TO=$sk
+    if (( flash )); then
+        tile_of "█" $(( wide + 2 ))
+        for (( r=py1; r<sk; r++ )); do
+            lum=$(( flash * 2 - (sk - r) * 3 )); (( lum < 0 )) && lum=0
+            pane_sty $(( ${PANE_R[$r]:-20} + lum )) $(( ${PANE_G[$r]:-26} + lum )) \
+                     $(( ${PANE_B[$r]:-46} + lum + 10 )) "$r"
+            put "$r" "$px1" "$STY" "${TILE:0:wide}"
+        done
+    fi
+
+    # the town's windows, blurred into soft lights by the wet glass
+    for (( i=0; i<20; i++ )); do
+        y=$(( sk + (i * 3 + i/2) % (py2 - sk + 1) ))
         (( y < py1 || y > py2 )) && continue
         x=$(( px1 + (i * 7 + i*i*3) % wide ))
         (( ${SIN[$(( (f + i*21) % 60 ))]} > 260 )) || continue
-        if (( i % 3 )); then bgtable_sty 226 $(( 180 + i % 40 )) 110 "$y"
-        else                 bgtable_sty 130 170 220 "$y"
+        if (( i % 3 )); then pane_sty 226 $(( 180 + i % 40 )) 110 "$y"
+        else                 pane_sty 130 170 220 "$y"
         fi
         put "$y" "$x" "$STY" "░"
     done
 
-    # rain on the pane: beads that run down, each on its own speed, plus the
-    # streaks they leave behind them
-    for (( i=0; i<40; i++ )); do
-        y=$(( py1 + (f * (2 + i % 3) / 4 + i * 5 + i/3) % (py2 - py1 + 1) ))
+    # rain falling out there, leaning with the gusts. It sits behind the beads
+    # on the glass, and it is dim, so the pane reads as two layers deep.
+    slant=$(( ${SIN[$(( (f / 3) % 60 ))]} > 500 ? 1 : 0 ))
+    for (( i=0; i<26; i++ )); do
+        y=$(( py1 + (f * 3 + i * 7 + i/2) % (py2 - py1 + 1) ))
+        x=$(( px1 + (i * 13 + i*i*5 + f / 2) % wide ))
+        pane_sty $(( 82 + i % 20 )) $(( 104 + i % 20 )) 148 "$y"
+        (( slant )) && put "$y" "$x" "$STY" "╱" || put "$y" "$x" "$STY" "╲"
+    done
+
+    # rain on the pane: beads gathering, then running. A bead's progress is
+    # squared over its cycle, so it creeps at the top of the glass and picks up
+    # speed on the way down, dragging a longer tail as it goes.
+    cyc=$(( py2 - py1 + 7 ))
+    for (( i=0; i<30; i++ )); do
+        p=$(( (f * (2 + i % 3) / 3 + i * 11 + i*i) % cyc ))
+        y=$(( py1 + p * p / cyc ))
+        (( y > py2 )) && continue
         x=$(( px1 + (i * 11 + i*i*7) % wide ))
         lum=$(( 170 + ${SIN[$(( (f + i*13) % 60 ))]} * 60 / 1000 ))
-        bgtable_sty "$lum" $(( lum + 30 > 255 ? 255 : lum + 30 )) 255 "$y"
+        pane_sty "$lum" $(( lum + 30 > 255 ? 255 : lum + 30 )) 255 "$y"
         if (( i % 4 )); then put "$y" "$x" "$STY" "·"
         else                 put "$y" "$x" "$STY" "╷"; fi
-        (( y-1 >= py1 && i % 3 == 0 )) && {
-            bgtable_sty $(( lum - 60 )) $(( lum - 30 )) 220 $(( y - 1 ))
-            put $(( y - 1 )) "$x" "$STY" "╵"
-        }
+        # the streak it left, as long as it is travelling fast
+        for (( n=1; n<=p*3/cyc; n++ )); do
+            r=$(( y - n ))
+            (( r < py1 )) && break
+            pane_sty $(( lum - 40 - n*24 )) $(( lum - 20 - n*20 )) \
+                     $(( 240 - n*20 )) "$r"
+            put "$r" "$x" "$STY" "╵"
+        done
     done
-    # a drop or two chasing all the way down the outside of the glass
+    # two fat drops chasing all the way down, wobbling around the ones ahead
     for i in 0 1; do
         y=$(( py1 + (f / 2 + i * 9) % (py2 - py1 + 1) ))
         x=$(( px1 + 3 + (i * 13) % (wide > 4 ? wide - 4 : 1) ))
-        for (( n=0; n<4; n++ )); do
+        for (( n=0; n<5; n++ )); do
             r=$(( y - n ))
             (( r < py1 || r > py2 )) && continue
-            bgtable_sty $(( 220 - n * 30 )) $(( 236 - n * 26 )) 255 "$r"
+            pane_sty $(( 226 - n * 28 )) $(( 240 - n * 24 )) 255 "$r"
             if (( n == 0 )); then put "$r" "$x" "$STY" "●"
-            else                  put "$r" "$x" "$STY" "│"; fi
+            else put "$r" $(( x + (${SIN[$(( (i*20 + n*9) % 60 ))]} - 500) / 460 )) \
+                     "$STY" "│"
+            fi
         done
     done
 
-    # steam off the mug, curling as it goes up
-    for (( n=0; n<4; n++ )); do
-        r=$(( sill - 2 - n ))
+    # the room comes back over the top: frame, mullions, sill, boards, and the
+    # mug and plant standing on it, so nothing outside runs across them
+    OUT+=$WINDOW_FG
+
+    # steam off the mug, curling as it goes up and thinning out
+    for (( n=0; n<5; n++ )); do
+        r=$(( sill - 3 - n ))
         (( r < 1 || r > H-1 )) && break
-        g=$(( 210 - n * 26 ))
-        bgtable_sty "$g" "$g" $(( g - 20 )) "$r"
-        put "$r" $(( px1 + 3 + (${SIN[$(( (f*2 + n*11) % 60 ))]} - 500) / 400 )) \
-            "$STY" "·"
+        g=$(( 214 - n * 24 ))
+        bgtable_sty "$g" "$g" $(( g - 24 )) "$r"
+        x=$(( px1 + 3 + (${SIN[$(( (f*2 + n*13) % 60 ))]} - 500) / 330 ))
+        case $(( (f/3 + n) % 3 )) in
+            0) put "$r" "$x" "$STY" "˙" ;;
+            1) put "$r" "$x" "$STY" "·" ;;
+            *) put "$r" "$x" "$STY" "‧" ;;
+        esac
     done
 
     # the banner reads as light thrown on the glass, so it sits over the pane
@@ -6555,6 +6927,66 @@ pick_scene() { # ok|fail
 scene_ok()   { "${OK_VARIANTS[$OK_PICK]}" "$1"; }
 scene_fail() { "${FAIL_VARIANTS[$FAIL_PICK]}" "$1"; }
 
+# --list-scenes: the tables are the source of truth, so nothing to keep in sync
+list_scenes() {
+    local v
+    echo "success scenes (--scene NAME):"
+    for v in "${OK_VARIANTS[@]}"; do echo "  ${v#scene_ok_}"; done
+    echo
+    echo "failure scenes (--scene NAME, or fail:NAME to disambiguate):"
+    for v in "${FAIL_VARIANTS[@]}"; do echo "  ${v#scene_fail_}"; done
+}
+
+# --scene NAME -> SCENE_STATE (ok|fail) plus the matching *_PICK index.
+# A bare name is looked up in both tables; an "ok:"/"fail:" prefix, or the full
+# function name, pins which table to search.
+resolve_scene() { # name
+    local want=$1 side="" i n
+    case "$want" in
+        ok:*)          side=ok;   want=${want#ok:} ;;
+        fail:*)        side=fail; want=${want#fail:} ;;
+        scene_ok_*)    side=ok;   want=${want#scene_ok_} ;;
+        scene_fail_*)  side=fail; want=${want#scene_fail_} ;;
+    esac
+    if [ "$side" != fail ]; then
+        n=${#OK_VARIANTS[@]}
+        for (( i=0; i<n; i++ )); do
+            if [ "${OK_VARIANTS[$i]#scene_ok_}" = "$want" ]; then
+                SCENE_STATE=ok; OK_PICK=$i; return 0
+            fi
+        done
+    fi
+    if [ "$side" != ok ]; then
+        n=${#FAIL_VARIANTS[@]}
+        for (( i=0; i<n; i++ )); do
+            if [ "${FAIL_VARIANTS[$i]#scene_fail_}" = "$want" ]; then
+                SCENE_STATE=fail; FAIL_PICK=$i; return 0
+            fi
+        done
+    fi
+    return 1
+}
+
+# n/N in --scene mode: step through that state's table, wrapping round
+step_scene() { # +1|-1
+    local n
+    if [ "$SCENE_STATE" = ok ]; then
+        n=${#OK_VARIANTS[@]}
+        OK_PICK=$(( (OK_PICK + $1 + n) % n ))
+    else
+        n=${#FAIL_VARIANTS[@]}
+        FAIL_PICK=$(( (FAIL_PICK + $1 + n) % n ))
+    fi
+    BG_KEY=""       # the incoming variant rebuilds its own backdrop table
+}
+
+# the name currently on screen, for the status bar in --scene mode
+scene_name() {
+    if [ "$SCENE_STATE" = ok ]; then SCENE_NAME=${OK_VARIANTS[$OK_PICK]#scene_ok_}
+    else SCENE_NAME=${FAIL_VARIANTS[$FAIL_PICK]#scene_fail_}
+    fi
+}
+
 # ----------------------------------------------------------- building scene --
 
 scene_building() {
@@ -6659,8 +7091,16 @@ status_bar() {
     esac
     local warn=""
     (( WARNINGS > 0 )) && warn=" · ${WARNINGS} warning(s)"
-    local left=" ${PROJECT} │ ${JOB} │ ${icon}${warn} │ ${AGE}s ago "
-    local right=" q quit · 1-4 job · r rerun · l log · p pause "
+    local left right
+    if [ -n "${SCENE_STATE:-}" ]; then
+        # preview mode: the scene name is the useful thing, not the build
+        scene_name
+        left=" ${PROJECT} │ preview │ ${icon} │ ${SCENE_NAME} "
+        right=" q quit · n/N scene · p pause "
+    else
+        left=" ${PROJECT} │ ${JOB} │ ${icon}${warn} │ ${AGE}s ago "
+        right=" q quit · 1-4 job · r rerun · l log · p pause "
+    fi
     local pad=$(( W - ${#left} - ${#right} ))
     (( pad < 0 )) && { right=""; pad=$(( W - ${#left} )); }
     (( pad < 0 )) && pad=0
@@ -6668,6 +7108,18 @@ status_bar() {
 }
 
 # ------------------------------------------------------------------ main -----
+
+# plain stdout, no terminal needed: safe to pipe or grep
+(( LIST_SCENES )) && { list_scenes; exit 0; }
+
+SCENE_STATE=""
+if [ -n "$SCENE_ONLY" ]; then
+    resolve_scene "$SCENE_ONLY" || {
+        echo "unknown scene: $SCENE_ONLY" >&2
+        echo "try --list-scenes" >&2
+        exit 2
+    }
+fi
 
 TTY=/dev/tty
 if ! { : <"$TTY"; } 2>/dev/null; then
@@ -6696,19 +7148,37 @@ SCENE_H=0
 PREV_OUT=""
 REDRAW=1
 # roll the first variant of each kind, so a run does not always open the same way
-OK_PICK=$(( RANDOM % ${#OK_VARIANTS[@]} ))
-FAIL_PICK=$(( RANDOM % ${#FAIL_VARIANTS[@]} ))
+# (--scene already pinned its pick, so leave that one alone)
+[ "$SCENE_STATE" = ok ]   || OK_PICK=$(( RANDOM % ${#OK_VARIANTS[@]} ))
+[ "$SCENE_STATE" = fail ] || FAIL_PICK=$(( RANDOM % ${#FAIL_VARIANTS[@]} ))
 
 printf '\033[?1049h\033[?25l\033[2J'
 term_size
 start_reader
-start_bacon
+if [ -n "$SCENE_STATE" ]; then
+    # preview mode: no build to watch, so fake the state the scene wants. Fail
+    # scenes draw a list of failing items, so give them something to show.
+    STATE=$SCENE_STATE; PREV_STATE=$SCENE_STATE
+    if [ "$SCENE_STATE" = fail ]; then
+        ERRORS=3; WARNINGS=2; TEST_FAILS=1
+        ITEMS=("cannot find value \`kettle\` in this scope"
+               "  src/main.rs:42:9"
+               "mismatched types: expected \`Scene\`, found \`Option<Scene>\`"
+               "  src/render.rs:118:22"
+               "unused variable: \`carousel\`"
+               "  src/scene.rs:7:5")
+    fi
+else
+    start_bacon
+fi
 
 while :; do
     (( RESIZED )) && { RESIZED=0; term_size; REDRAW=1; PREV_OUT=""; }
 
     # ---- poll state (cheap: only when the report actually changed) ----
-    if (( FRAME % POLL_EVERY == 0 )); then
+    # In --scene mode there is no bacon and no report, so STATE is fixed and the
+    # whole poll / hold / variant-roll block is skipped.
+    if [ -z "$SCENE_STATE" ] && (( FRAME % POLL_EVERY == 0 )); then
         mt=$(stat -f %m "$REPORT" 2>/dev/null || echo 0)
         if [ "$mt" != "$REPORT_MTIME" ]; then
             REPORT_MTIME=$mt
@@ -6739,7 +7209,8 @@ while :; do
         kill -0 "$BACON_PID" 2>/dev/null || { CMD_ERROR=1; ERRORS=1; }
     fi
 
-    if (( BUILDING )); then STATE=building
+    if [ -n "$SCENE_STATE" ]; then STATE=$SCENE_STATE
+    elif (( BUILDING )); then STATE=building
     elif (( ERRORS > 0 || TEST_FAILS > 0 || CMD_ERROR )); then STATE=fail
     else STATE=ok
     fi
@@ -6801,14 +7272,20 @@ while :; do
         case "$key" in
             q|Q) cleanup ;;
             p|P) PAUSED=$(( 1 - PAUSED )) ;;
-            r|R) start_bacon; REDRAW=1 ;;
-            l|L) case "$VIEW" in
+            # rerun, job switch and the log view all need a bacon behind them,
+            # so in --scene mode n/N step through the scenes instead
+            n) [ -n "$SCENE_STATE" ] && { step_scene 1; REDRAW=1; } ;;
+            N) [ -n "$SCENE_STATE" ] && { step_scene -1; REDRAW=1; } ;;
+            r|R) [ -n "$SCENE_STATE" ] || { start_bacon; REDRAW=1; } ;;
+            l|L) [ -n "$SCENE_STATE" ] && continue
+                 case "$VIEW" in
                      scene) VIEW=split ;;
                      split) VIEW=log ;;
                      *)     VIEW=scene ;;
                  esac
                  LOG_DIRTY=1; REDRAW=1 ;;
-            1|2|3|4) JOB=${JOBS[$(( key - 1 ))]}; start_bacon; REDRAW=1 ;;
+            1|2|3|4) [ -n "$SCENE_STATE" ] ||
+                     { JOB=${JOBS[$(( key - 1 ))]}; start_bacon; REDRAW=1; } ;;
         esac
     done
 

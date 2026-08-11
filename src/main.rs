@@ -38,14 +38,16 @@ struct VAE {
 
 /// Variational Auto Encoder
 impl VAE {
-    fn new(vb: VarBuilder, pixels: usize, hidden: usize, latent: usize) -> Result<Self> {
-        let resolution: usize = pixels * pixels * 3;
-        let config: Conv2dConfig = Conv2dConfig { padding: 2, ..Default::default() };
+    fn new(vb: VarBuilder, pixels: usize) -> Result<Self> {
+        let half = pixels / 4;
+        let latent = half;
+        let hidden = half * half * 3;
+        let config: Conv2dConfig = Conv2dConfig { stride: 2, padding: 1, ..Default::default() };
         let encoder: Conv2d = conv2d(3, 3, 3, config, vb.pp("conv2d-encoder"))?;
         let encoder_to_decoder = linear(latent, hidden, vb.pp("translator"))?;
         let decoder: Conv2d = conv2d(3, 3, 3, config, vb.pp("conv2d-decoder"))?;
-        let fc_mu = linear(hidden, latent, vb.pp("fc_mu"))?;
-        let fc_var = linear(hidden, latent, vb.pp("fc_var"))?;
+        let fc_mu = linear(hidden * 4, latent, vb.pp("fc_mu"))?;
+        let fc_var = linear(hidden * 4, latent, vb.pp("fc_var"))?;
         let output = conv2d(3, 3, 3, config, vb.pp("conv2d-output"))?;
 
         Ok(Self {
@@ -58,14 +60,40 @@ impl VAE {
         })
     }
 
+    fn reparamerterize(&self, fc_mu: &Tensor, fc_var: &Tensor) -> Result<Tensor> {
+        let std = (0.5 * fc_var)?.exp()?;
+        let eps = std.randn_like(0.0, 1.0)?;
+        let out = (eps * std)?;
+        let out = (out + fc_mu)?;
+        Ok(out)
+    }
+
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let out = self.encoder.forward(input)?;
+        //println!("self.encoder.forward {:?}", out.shape());
+        let pooled = out.max_pool2d(2)?;
+        //println!("pooled {:?}", pooled.shape());
+        let flat = out.flatten_from(1)?;
+        //println!("flat {:?}", flat.shape());
+        let fc_mu = self.fc_mu.forward(&flat)?;
+        //println!("fc_mu {:?}", fc_mu.shape());
+        let fc_var = self.fc_var.forward(&flat)?;
+        //println!("fc_var {:?}", fc_var.shape());
+        let repram = self.reparamerterize(&fc_mu, &fc_var)?;
+        let out = self.decode(&repram)?;
+
         //let out = self.encoder.forward(input)?;
         //let out = self.layer2.forward(&out)?.tanh()?;
         //let out = self.layer3.forward(&out)?.tanh()?;
 
         Ok(out)
     }
+
+    fn decode(&self, input: &Tensor) -> Result<Tensor> {
+        let out = self.decoder.forward(input)?;
+        Ok(out)
+    }
+
 }
 
 fn load_image(device: &Device, filename: &str, resize: u32) -> Result<Tensor> {
@@ -94,13 +122,13 @@ fn main() -> Result<()> {
     //let labels   = [[0.0],      [0.0],      [1.0],      [1.0]     ];
     //let input: Tensor = Tensor::new(&features, &device)?; 
     //let targets: Tensor = Tensor::new(&labels, &device)?; 
-    println!("Cat: {:?}", cat.shape());
+    //println!("Cat: {:?}", cat.shape());
 
     let vm = VarMap::new();
     let vb = VarBuilder::from_varmap(&vm, DType::F64, &device);
-    let model = VAE::new(vb, 32, 64, 32)?;
+    let model = VAE::new(vb, 32)?;
     let output = model.forward(&cat)?;
-    println!("{output}");
+    //println!("{output}");
     //println!("Encoder: {:?}", model.encoder.shape());
     
 
