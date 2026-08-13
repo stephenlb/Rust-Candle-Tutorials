@@ -7,6 +7,7 @@ use candle_nn::{
     linear, Linear,
     Module,
     VarBuilder, VarMap,
+    // TODO AdamW instead of SGD
     SGD, Optimizer
 };
 use anyhow::Result;
@@ -26,6 +27,8 @@ use anyhow::Result;
 **/
 
 struct VAE {
+    pixels: usize,
+    channels: usize,
     // TODO The math says you need to add a regulerization term over the output of decoder so it is as close as you can to being normal. so thats the mean squared and the distance of the std from 1 squared
     encoder: Conv2d, 
     // TODO The math says you need to add a regulerization term over the output of decoder so it is as close as you can to being normal. so thats the mean squared and the distance of the std from 1 squared
@@ -40,17 +43,22 @@ struct VAE {
 impl VAE {
     fn new(vb: VarBuilder, pixels: usize) -> Result<Self> {
         let half = pixels / 4;
+        let channels = 3;
         let latent = half;
-        let hidden = half * half * 3;
+        let hidden = half * half * channels;
+
         let config: Conv2dConfig = Conv2dConfig { stride: 2, padding: 1, ..Default::default() };
-        let encoder: Conv2d = conv2d(3, 3, 3, config, vb.pp("conv2d-encoder"))?;
-        let encoder_to_decoder = linear(latent, hidden, vb.pp("translator"))?;
+        let decode_config: Conv2dConfig = Conv2dConfig { stride: 1, padding: 1, ..Default::default() };
+        let encoder: Conv2d = conv2d(channels, 3, 3, config, vb.pp("conv2d-encoder"))?;
         let fc_mu = linear(hidden * 4, latent, vb.pp("fc_mu"))?;
         let fc_var = linear(hidden * 4, latent, vb.pp("fc_var"))?;
-        let decoder: Conv2d = conv2d(hidden, hidden, 3, config, vb.pp("conv2d-decoder"))?;
-        let output = conv2d(hidden, 3, 3, config, vb.pp("conv2d-output"))?;
+        let encoder_to_decoder = linear(latent, hidden, vb.pp("translator"))?;
+        let decoder: Conv2d = conv2d(channels, hidden, 1, decode_config, vb.pp("conv2d-decoder"))?;
+        let output: Conv2d = conv2d(hidden, channels, 1, decode_config, vb.pp("conv2d-output"))?;
 
         Ok(Self {
+            pixels,
+            channels,
             encoder,
             decoder,
             encoder_to_decoder,
@@ -90,17 +98,40 @@ impl VAE {
     }
 
     fn decode(&self, input: &Tensor) -> Result<Tensor> {
+        let batch = input.dim(0)?;
         println!("DECODE input {:?}", input.shape());
-        let out = self.decoder.forward(input)?;
+        let out = self.encoder_to_decoder.forward(input)?;
+        let out = out.tanh()?;
         println!("out {:?}", out.shape());
-        Ok(out)
-    }
+        let out = out.reshape((batch, self.channels, self.pixels / 4, self.pixels / 4))?;
+        println!("out {:?}", out.shape());
+        let out = self.decoder.forward(&out)?;
+        println!("out {:?}", out.shape());
+        let out = self.output.forward(&out)?;
+        println!("out {:?}", out.shape());
+        let out = out.tanh()?;
+        println!("out {:?}", out.shape());
+        let out = out.upsample_nearest2d(self.pixels, self.pixels)?;
+        println!("out {:?}", out.shape());
+        let out = candle_nn::ops::sigmoid(&out)?;
+        println!("out {:?}", out.shape());
 
+        Ok(out)
+        /* TODO
+        let encoder_to_decoder = linear(latent, hidden, vb.pp("translator"))?;
+        let decoder: Conv2d = conv2d(hidden, hidden, 3, config, vb.pp("conv2d-decoder"))?;
+        let output = conv2d(hidden, 3, 3, config, vb.pp("conv2d-output"))?;
+        */
+    }
+}
+
+// TODO next stream will outupt
+fn save_iamge(data: &Tensor, filename: &str) {
+    //let result = image::save(data, filename)?;
 }
 
 fn load_image(device: &Device, filename: &str, resize: u32) -> Result<Tensor> {
     let img = image::open(filename)?;
-    //let resized_img = img.resize(300, 300, FilterType::Lanczos3);
     let resized = img.thumbnail(resize, resize);
     let bytes = resized.to_rgb8().into_raw();
     let pixels: Vec<f64> = bytes
@@ -110,7 +141,6 @@ fn load_image(device: &Device, filename: &str, resize: u32) -> Result<Tensor> {
 
     let resolution: usize = resize as usize * resize  as usize * 3;
     let out = Tensor::from_vec(pixels, (1, 3, resize as usize, resize as usize), device)?;
-    //let out = out.reshape((resize))?;
 
     Ok(out)
 }
