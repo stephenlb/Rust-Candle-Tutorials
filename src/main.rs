@@ -117,17 +117,34 @@ impl VAE {
         println!("out {:?}", out.shape());
 
         Ok(out)
-        /* TODO
-        let encoder_to_decoder = linear(latent, hidden, vb.pp("translator"))?;
-        let decoder: Conv2d = conv2d(hidden, hidden, 3, config, vb.pp("conv2d-decoder"))?;
-        let output = conv2d(hidden, 3, 3, config, vb.pp("conv2d-output"))?;
-        */
     }
 }
 
-// TODO next stream will outupt
-fn save_iamge(data: &Tensor, filename: &str) {
-    //let result = image::save(data, filename)?;
+fn save_image(
+    data: &Tensor,
+    width: u32,
+    height: u32,
+    filename: &str,
+) -> Result<()> {
+    let pixels: Vec<f64> = data
+        .permute((0, 2, 3, 1))?
+        .flatten_all()?
+        .to_vec1()?;
+
+    let buffer: Vec<u8> = pixels
+        .into_iter()
+        .map( |color| (color * 255.0) as u8)
+        .collect();
+
+    image::save_buffer(
+        filename,
+        &buffer,
+        width,
+        height,
+        image::ExtendedColorType::Rgb8,
+    )?;
+
+    Ok(())
 }
 
 fn load_image(device: &Device, filename: &str, resize: u32) -> Result<Tensor> {
@@ -150,6 +167,16 @@ fn main() -> Result<()> {
     let device = Device::Cpu;
     let pixels: u32 = 32;
     let cat: Tensor = load_image(&device, "cat.png",  pixels)?;
+    let noise = cat.randn_like(0.0, 1.0)?;
+    let noise = noise.abs()?;
+    
+    println!("Cat: {:?}", cat.shape());
+    println!("Noise: {:?}", noise.shape());
+    println!("{noise}");
+
+    for i in (0..10) {
+        println!("hello khaled");
+    }
     //let features = [[1.0, 1.0], [0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
     //let labels   = [[0.0],      [0.0],      [1.0],      [1.0]     ];
     //let input: Tensor = Tensor::new(&features, &device)?; 
@@ -160,10 +187,16 @@ fn main() -> Result<()> {
     let vb = VarBuilder::from_varmap(&vm, DType::F64, &device);
     let model = VAE::new(vb, 32)?;
     let output = model.forward(&cat)?;
-    //println!("{output}");
+    let out = save_image(
+        &output,
+        32,
+        32,
+        "out.png",
+    )?;
+    println!("{:?}", out);
+
     //println!("Encoder: {:?}", model.encoder.shape());
     
-
     // Training Phase
     /*
     let learing_rate = 0.02;
