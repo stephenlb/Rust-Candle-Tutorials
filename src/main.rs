@@ -1,14 +1,11 @@
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{
     conv2d, Conv2d, Conv2dConfig,
-    // Tensor::max_pool2d
-    // Tensor::upsample_nearest2d
     seq, Sequential,
     linear, Linear,
     Module,
     VarBuilder, VarMap,
-    // TODO AdamW instead of SGD
-    SGD, Optimizer
+    AdamW, Optimizer,
 };
 use anyhow::Result;
 
@@ -99,22 +96,13 @@ impl VAE {
 
     fn decode(&self, input: &Tensor) -> Result<Tensor> {
         let batch = input.dim(0)?;
-        println!("DECODE input {:?}", input.shape());
         let out = self.encoder_to_decoder.forward(input)?;
         let out = out.tanh()?;
-        println!("out {:?}", out.shape());
         let out = out.reshape((batch, self.channels, self.pixels / 4, self.pixels / 4))?;
-        println!("out {:?}", out.shape());
         let out = self.decoder.forward(&out)?;
-        println!("out {:?}", out.shape());
         let out = self.output.forward(&out)?;
-        println!("out {:?}", out.shape());
-        let out = out.tanh()?;
-        println!("out {:?}", out.shape());
         let out = out.upsample_nearest2d(self.pixels, self.pixels)?;
-        println!("out {:?}", out.shape());
         let out = candle_nn::ops::sigmoid(&out)?;
-        println!("out {:?}", out.shape());
 
         Ok(out)
     }
@@ -133,7 +121,7 @@ fn save_image(
 
     let buffer: Vec<u8> = pixels
         .into_iter()
-        .map( |color| (color * 255.0) as u8)
+        .map( |color| (color.clamp(0.0, 1.0) * 255.0) as u8)
         .collect();
 
     image::save_buffer(
@@ -149,7 +137,7 @@ fn save_image(
 
 fn load_image(device: &Device, filename: &str, resize: u32) -> Result<Tensor> {
     let img = image::open(filename)?;
-    let resized = img.thumbnail(resize, resize);
+    let resized = img.resize_exact(resize, resize, image::imageops::FilterType::Triangle);
     let bytes = resized.to_rgb8().into_raw();
     let pixels: Vec<f64> = bytes
         .into_iter()
@@ -157,7 +145,9 @@ fn load_image(device: &Device, filename: &str, resize: u32) -> Result<Tensor> {
         .collect();
 
     let resolution: usize = resize as usize * resize  as usize * 3;
-    let out = Tensor::from_vec(pixels, (1, 3, resize as usize, resize as usize), device)?;
+    let out = Tensor::from_vec(pixels, (1, 3, resize as usize, resize as usize), device)?
+        .permute((0, 3, 1, 2))?
+        .contiguous()?;
 
     Ok(out)
 }
@@ -167,16 +157,11 @@ fn main() -> Result<()> {
     let device = Device::Cpu;
     let pixels: u32 = 32;
     let cat: Tensor = load_image(&device, "cat.png",  pixels)?;
-    let noise = cat.randn_like(0.0, 1.0)?;
-    let noise = noise.abs()?;
+    let input = cat.randn_like(0.0, 1.0)?;
+    let input = input.abs()?;
     
     println!("Cat: {:?}", cat.shape());
-    println!("Noise: {:?}", noise.shape());
-    println!("{noise}");
-
-    for i in (0..10) {
-        println!("hello khaled");
-    }
+    println!("Noise: {:?}", input.shape());
     //let features = [[1.0, 1.0], [0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
     //let labels   = [[0.0],      [0.0],      [1.0],      [1.0]     ];
     //let input: Tensor = Tensor::new(&features, &device)?; 
@@ -185,12 +170,12 @@ fn main() -> Result<()> {
 
     let vm = VarMap::new();
     let vb = VarBuilder::from_varmap(&vm, DType::F64, &device);
-    let model = VAE::new(vb, 32)?;
+    let model = VAE::new(vb, pixels as usize)?;
     let output = model.forward(&cat)?;
     let out = save_image(
         &output,
-        32,
-        32,
+        pixels,
+        pixels,
         "out.png",
     )?;
     println!("{:?}", out);
@@ -198,23 +183,28 @@ fn main() -> Result<()> {
     //println!("Encoder: {:?}", model.encoder.shape());
     
     // Training Phase
-    /*
     let learing_rate = 0.02;
-    let mut optimizer = SGD::new(vm.all_vars(), learing_rate)?;
+    let adam_config = candle_nn::ParamsAdamW {
+        lr: 0.02,
+        ..Default::default()
+    };
+    let mut optimizer = AdamW::new(vm.all_vars(), adam_config)?;
+    //let mut optimizer = SGD::new(vm.all_vars(), learing_rate)?;
     let epochs = 800;
     for epoch in 0..=epochs {
         let output = model.forward(&input)?;
-        let loss = candle_nn::loss::mse(&output, &targets)?;
+        let loss = candle_nn::loss::mse(&output, &cat)?;
         optimizer.backward_step(&loss)?;
         let loss_val: f64 = loss.to_scalar()?;
         println!("Epoch: {epoch} Loss: {loss_val}");
     }
-    */
 
-    /*
-    let output = model.forward(&input)?;
-    println!("{output}");
-    */
+    let out = save_image(
+        &output,
+        32,
+        32,
+        "out-trained.png",
+    )?;
 
     Ok(())
 }
