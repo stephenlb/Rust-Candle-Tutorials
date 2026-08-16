@@ -156,11 +156,13 @@ fn loss_fn(
     let kld_loss = (kld_loss + fc_mu.sqr()?)?;
     let kld_loss = (kld_loss - fc_var.exp()?)?;
     let kld_loss = kld_loss.sum(1)?;
-    let kld_loss = kld_loss.mean_all()?;
-    let kld_loss = (-0.5 * kld_loss)?;
-    let out = (loss + (kld_weight * kld_loss)?)?;
+    //let kld_loss = kld_loss.mean_all()?;
+    //let kld_loss = (-0.5 * kld_loss)?;
+    println!("kld_weight: {:?}", kld_weight.shape());
+    println!("kld_loss: {:?}", kld_loss.shape());
+    //let out = (loss + (kld_weight * kld_loss)?)?;
 
-    Ok(kld_loss)
+    Ok(loss)
 }
 
 fn main() -> Result<()> {
