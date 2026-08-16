@@ -73,25 +73,16 @@ impl VAE {
         Ok(out)
     }
 
-    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+    fn forward(&self, input: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let out = self.encoder.forward(input)?;
-        //println!("self.encoder.forward {:?}", out.shape());
         let pooled = out.max_pool2d(2)?;
-        //println!("pooled {:?}", pooled.shape());
         let flat = out.flatten_from(1)?;
-        //println!("flat {:?}", flat.shape());
         let fc_mu = self.fc_mu.forward(&flat)?;
-        //println!("fc_mu {:?}", fc_mu.shape());
         let fc_var = self.fc_var.forward(&flat)?;
-        //println!("fc_var {:?}", fc_var.shape());
         let latent = self.reparamerterize(&fc_mu, &fc_var)?;
         let out = self.decode(&latent)?;
 
-        //let out = self.encoder.forward(input)?;
-        //let out = self.layer2.forward(&out)?.tanh()?;
-        //let out = self.layer3.forward(&out)?.tanh()?;
-
-        Ok(out)
+        Ok((out, fc_mu, fc_var,))
     }
 
     fn decode(&self, input: &Tensor) -> Result<Tensor> {
@@ -145,11 +136,31 @@ fn load_image(device: &Device, filename: &str, resize: u32) -> Result<Tensor> {
         .collect();
 
     let resolution: usize = resize as usize * resize  as usize * 3;
-    let out = Tensor::from_vec(pixels, (1, 3, resize as usize, resize as usize), device)?
-        .permute((0, 3, 1, 2))?
-        .contiguous()?;
+    let out = Tensor::from_vec(pixels, (1, 3, resize as usize, resize as usize), device)?;
+        //.permute((0, 1, 2, 3))?
+        //.contiguous()?;
 
     Ok(out)
+}
+
+fn loss_fn(
+    output: &Tensor,
+    target: &Tensor,
+    kld_weight: &Tensor,
+    fc_mu: &Tensor,
+    fc_var: &Tensor,
+) ->  Result<Tensor> {
+    // TODO kl divergence
+    let loss = candle_nn::loss::mse(output, target)?;
+    let kld_loss = (fc_var + 1.0)?;
+    let kld_loss = (kld_loss + fc_mu.sqr()?)?;
+    let kld_loss = (kld_loss - fc_var.exp()?)?;
+    let kld_loss = kld_loss.sum(1)?;
+    let kld_loss = kld_loss.mean_all()?;
+    let kld_loss = (-0.5 * kld_loss)?;
+    let out = (loss + (kld_weight * kld_loss)?)?;
+
+    Ok(kld_loss)
 }
 
 fn main() -> Result<()> {
@@ -171,14 +182,17 @@ fn main() -> Result<()> {
     let vm = VarMap::new();
     let vb = VarBuilder::from_varmap(&vm, DType::F64, &device);
     let model = VAE::new(vb, pixels as usize)?;
-    let output = model.forward(&cat)?;
+    let kld_weight: Tensor = Tensor::new(&[0.003], &device)?;
+    let (output, fc_mu, fc_var) = model.forward(&cat)?;
+    let loss = loss_fn(&output, &cat, &kld_weight, &fc_mu, &fc_var)?;
+    println!("Loss: {:?}", loss);
     let out = save_image(
         &output,
         pixels,
         pixels,
         "out.png",
     )?;
-    println!("{:?}", out);
+    //println!("{}", output);
 
     //println!("Encoder: {:?}", model.encoder.shape());
     
@@ -189,8 +203,9 @@ fn main() -> Result<()> {
         ..Default::default()
     };
     let mut optimizer = AdamW::new(vm.all_vars(), adam_config)?;
-    //let mut optimizer = SGD::new(vm.all_vars(), learing_rate)?;
     let epochs = 800;
+    return Ok(());
+    /*
     for epoch in 0..=epochs {
         let output = model.forward(&input)?;
         let loss = candle_nn::loss::mse(&output, &cat)?;
@@ -198,6 +213,7 @@ fn main() -> Result<()> {
         let loss_val: f64 = loss.to_scalar()?;
         println!("Epoch: {epoch} Loss: {loss_val}");
     }
+    */
 
     let out = save_image(
         &output,
