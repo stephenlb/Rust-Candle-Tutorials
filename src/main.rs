@@ -77,8 +77,13 @@ impl VAE {
         let out = self.encoder.forward(input)?;
         let pooled = out.max_pool2d(2)?;
         let flat = out.flatten_from(1)?;
+
         let fc_mu = self.fc_mu.forward(&flat)?;
+        let fc_mu = candle_nn::ops::sigmoid(&fc_mu)?;
+
         let fc_var = self.fc_var.forward(&flat)?;
+        let fc_var = candle_nn::ops::sigmoid(&fc_var)?;
+
         let latent = self.reparamerterize(&fc_mu, &fc_var)?;
         let out = self.decode(&latent)?;
 
@@ -89,8 +94,7 @@ impl VAE {
         let batch = input.dim(0)?;
         let out = self.encoder_to_decoder.forward(input)?;
         let out = out.tanh()?;
-        let out = out.reshape((batch, self.channels, self.pixels / 4, self.pixels / 4))?;
-        let out = self.decoder.forward(&out)?;
+        let out = out.reshape((batch, self.channels, self.pixels / 4, self.pixels / 4))?; let out = self.decoder.forward(&out)?;
         let out = self.output.forward(&out)?;
         let out = out.upsample_nearest2d(self.pixels, self.pixels)?;
         let out = candle_nn::ops::sigmoid(&out)?;
@@ -146,23 +150,26 @@ fn load_image(device: &Device, filename: &str, resize: u32) -> Result<Tensor> {
 fn loss_fn(
     output: &Tensor,
     target: &Tensor,
-    kld_weight: &Tensor,
+    kld_weight: f64,
     fc_mu: &Tensor,
     fc_var: &Tensor,
 ) ->  Result<Tensor> {
-    // TODO kl divergence
-    let loss = candle_nn::loss::mse(output, target)?;
-    let kld_loss = (fc_var + 1.0)?;
-    let kld_loss = (kld_loss + fc_mu.sqr()?)?;
-    let kld_loss = (kld_loss - fc_var.exp()?)?;
-    let kld_loss = kld_loss.sum(1)?;
-    //let kld_loss = kld_loss.mean_all()?;
-    //let kld_loss = (-0.5 * kld_loss)?;
-    println!("kld_weight: {:?}", kld_weight.shape());
-    println!("kld_loss: {:?}", kld_loss.shape());
-    //let out = (loss + (kld_weight * kld_loss)?)?;
+     /// KL = 0.5 * (u^2 + s ^2 - 1 - 2log(s))
+     //  U = fc_mu
+     //  S = fc_var
+     /// KL = fc_mu^2 + s ^2 - 1 - 2 * s.log()
+     //   fc_mu.exp()? + fc_var.exp()? - 1.0 + 2 * fc_var.log()?
+    let kld_loss = (((fc_mu.exp()? + fc_var.exp()?)? - 1.0)? + (2.0 * fc_var.log()?)?)?;
+    let kld_loss = kld_loss.mean_all()?;
+    let kld_loss = (0.5 * kld_loss)?;
 
-    Ok(loss)
+    let loss = candle_nn::loss::mse(output, target)?;
+    println!("kld_loss: {}", kld_loss);
+    println!("kld_weight: {:?}", kld_weight);
+    println!("loss: {:?}", loss);
+    let out = (loss + (kld_weight * kld_loss)?)?;
+
+    Ok(out)
 }
 
 fn main() -> Result<()> {
@@ -173,8 +180,8 @@ fn main() -> Result<()> {
     let input = cat.randn_like(0.0, 1.0)?;
     let input = input.abs()?;
     
-    println!("Cat: {:?}", cat.shape());
-    println!("Noise: {:?}", input.shape());
+    //println!("Cat: {:?}", cat.shape());
+    //println!("Noise: {:?}", input.shape());
     //let features = [[1.0, 1.0], [0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
     //let labels   = [[0.0],      [0.0],      [1.0],      [1.0]     ];
     //let input: Tensor = Tensor::new(&features, &device)?; 
@@ -184,10 +191,10 @@ fn main() -> Result<()> {
     let vm = VarMap::new();
     let vb = VarBuilder::from_varmap(&vm, DType::F64, &device);
     let model = VAE::new(vb, pixels as usize)?;
-    let kld_weight: Tensor = Tensor::new(&[0.003], &device)?;
+    let kld_weight: f64 = 0.003;
     let (output, fc_mu, fc_var) = model.forward(&cat)?;
-    let loss = loss_fn(&output, &cat, &kld_weight, &fc_mu, &fc_var)?;
-    println!("Loss: {:?}", loss);
+    let loss = loss_fn(&output, &cat, kld_weight, &fc_mu, &fc_var)?;
+    //println!("Loss: {:?}", loss);
     let out = save_image(
         &output,
         pixels,
@@ -206,16 +213,13 @@ fn main() -> Result<()> {
     };
     let mut optimizer = AdamW::new(vm.all_vars(), adam_config)?;
     let epochs = 800;
-    return Ok(());
-    /*
     for epoch in 0..=epochs {
-        let output = model.forward(&input)?;
-        let loss = candle_nn::loss::mse(&output, &cat)?;
+        let (output, fc_mu, fc_var) = model.forward(&cat)?;
+        let loss = loss_fn(&output, &cat, kld_weight, &fc_mu, &fc_var)?;
         optimizer.backward_step(&loss)?;
         let loss_val: f64 = loss.to_scalar()?;
         println!("Epoch: {epoch} Loss: {loss_val}");
     }
-    */
 
     let out = save_image(
         &output,
