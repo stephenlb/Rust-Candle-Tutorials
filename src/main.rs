@@ -8,25 +8,11 @@ use candle_nn::{
 };
 use anyhow::Result;
 
-/**
- - TODO build model simple version
- - TODO build full model
- - TODO simple image for training
- - TODO training data
- - TODO image loader png -> Tensor
- - TODO 
- - TODO 
- - TODO 
- - TODO 
-
-**/
-
 struct VAE {
     pixels: usize,
     decode_channels: usize,
-    // TODO The math says you need to add a regulerization term over the output of decoder so it is as close as you can to being normal. so thats the mean squared and the distance of the std from 1 squared
-    encoder: Conv2d, 
-    // TODO The math says you need to add a regulerization term over the output of decoder so it is as close as you can to being normal. so thats the mean squared and the distance of the std from 1 squared
+    encoder: Conv2d,
+    encoder2: Conv2d,
     encoder_to_decoder: Linear,
     decoder: Conv2d, 
     fc_mu: Linear, 
@@ -43,10 +29,12 @@ impl VAE {
         let encoder_channels = 32;
         let latent = 64;
         let hidden = half * half * decode_channels;
-        let encoded = encoder_channels * (pixels / 2) * (pixels / 2);
+        // Two stride-2 encoder convs, so the spatial size is quartered.
+        let encoded = encoder_channels * (pixels / 4) * (pixels / 4);
         let config: Conv2dConfig = Conv2dConfig { stride: 2, padding: 1, ..Default::default() };
         let decode_config: Conv2dConfig = Conv2dConfig { stride: 1, padding: 1, ..Default::default() };
         let encoder: Conv2d = conv2d(channels, encoder_channels, 3, config, vb.pp("conv2d-encoder"))?;
+        let encoder2: Conv2d = conv2d(encoder_channels, encoder_channels, 3, config, vb.pp("conv2d-encoder2"))?;
         let fc_mu = linear(encoded, latent, vb.pp("fc_mu"))?;
         let fc_var = linear(encoded, latent, vb.pp("fc_var"))?;
         let encoder_to_decoder = linear(latent, hidden, vb.pp("translator"))?;
@@ -57,6 +45,7 @@ impl VAE {
             pixels,
             decode_channels,
             encoder,
+            encoder2,
             decoder,
             encoder_to_decoder,
             fc_mu,
@@ -75,6 +64,9 @@ impl VAE {
 
     fn forward(&self, input: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let out = self.encoder.forward(input)?;
+        let out = ((out.tanh()? + 1.0)? * 0.5)?;
+        let out = self.encoder2.forward(&out)?;
+        let out = ((out.tanh()? + 1.0)? * 0.5)?;
         let flat = out.flatten_from(1)?;
 
         let fc_mu = self.fc_mu.forward(&flat)?;
@@ -92,8 +84,7 @@ impl VAE {
         let out = out.tanh()?;
         let out = out.reshape((batch, self.decode_channels, self.pixels / 4, self.pixels / 4))?;
         let out = out.upsample_nearest2d(self.pixels, self.pixels)?;
-        let out = self.decoder.forward(&out)?;
-        let out = out.relu()?;
+        let out = self.decoder.forward(&out)?; let out = out.tanh()?;
         let out = self.output.forward(&out)?;
         let out = candle_nn::ops::sigmoid(&out)?;
 
@@ -107,7 +98,7 @@ fn save_image(
     height: u32,
     filename: &str,
 ) -> Result<()> {
-    let pixels: Vec<f64> = data
+    let pixels: Vec<f32> = data
         .permute((0, 2, 3, 1))?
         .contiguous()?
         .flatten_all()?
@@ -133,9 +124,9 @@ fn load_image(device: &Device, filename: &str, resize: u32) -> Result<Tensor> {
     let img = image::open(filename)?;
     let resized = img.resize_exact(resize, resize, image::imageops::FilterType::Triangle);
     let bytes = resized.to_rgb8().into_raw();
-    let pixels: Vec<f64> = bytes
+    let pixels: Vec<f32> = bytes
         .into_iter()
-        .map( |p| p as f64 / 255.0 )
+        .map( |p| p as f32 / 255.0 )
         .collect();
     let out = Tensor::from_vec(pixels, (1, resize as usize, resize as usize, 3), device)?
         .permute((0, 3, 1, 2))?
@@ -159,41 +150,28 @@ fn loss_fn(
     let kld_loss = (0.5 * kld_loss)?;
 
     let loss = candle_nn::loss::mse(output, target)?;
-    let out = (loss + (kld_weight * kld_loss)?)?;
+    let out = ((loss * 3.0)? + (kld_weight * kld_loss)?)?;
 
     Ok(out)
 }
 
 fn main() -> Result<()> {
     println!("Cat picture generator");
-    let device = Device::Cpu;
-    let pixels: u32 = 32;
+    //let device = Device::Cpu?;
+    let device = Device::new_metal(0)?;
+    println!("Device: {device:?}");
+    let pixels: u32 = 64;
     let cat: Tensor = load_image(&device, "cat.png",  pixels)?;
 
-    //println!("Cat: {:?}", cat.shape());
-    //println!("Noise: {:?}", input.shape());
-    //let features = [[1.0, 1.0], [0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
-    //let labels   = [[0.0],      [0.0],      [1.0],      [1.0]     ];
-    //let input: Tensor = Tensor::new(&features, &device)?; 
-    //let targets: Tensor = Tensor::new(&labels, &device)?; 
-    //println!("Cat: {:?}", cat.shape());
-
     let vm = VarMap::new();
-    let vb = VarBuilder::from_varmap(&vm, DType::F64, &device);
+    let vb = VarBuilder::from_varmap(&vm, DType::F32, &device);
     let model = VAE::new(vb, pixels as usize)?;
     let kld_weight: f64 = 0.003;
     let (output, fc_mu, fc_logvar) = model.forward(&cat)?;
     let loss = loss_fn(&output, &cat, kld_weight, &fc_mu, &fc_logvar)?;
-    println!("Initial Loss: {}", loss.to_scalar::<f64>()?);
-    save_image(
-        &output,
-        pixels,
-        pixels,
-        "out.png",
-    )?;
-    //println!("{}", output);
+    println!("Initial Loss: {}", loss.to_scalar::<f32>()?);
 
-    //println!("Encoder: {:?}", model.encoder.shape());
+    save_image(&output, pixels, pixels, "out.png")?;
     
     // Training Phase
     let learning_rate = 0.005;
@@ -207,18 +185,12 @@ fn main() -> Result<()> {
         let (output, fc_mu, fc_logvar) = model.forward(&cat)?;
         let loss = loss_fn(&output, &cat, kld_weight, &fc_mu, &fc_logvar)?;
         optimizer.backward_step(&loss)?;
-        let loss_val: f64 = loss.to_scalar()?;
+        let loss_val: f32 = loss.to_scalar()?;
         println!("Epoch: {epoch} Loss: {loss_val:.5}");
+        if epoch % 10 == 0 {
+            save_image(&output, pixels, pixels, "out.png")?;
+        }
     }
-
-    // Re-run the trained model: the `output` above is scoped to the loop.
-    let (trained, _fc_mu, _fc_logvar) = model.forward(&cat)?;
-    save_image(
-        &trained,
-        pixels,
-        pixels,
-        "out-trained.png",
-    )?;
 
     Ok(())
 }
